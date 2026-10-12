@@ -169,6 +169,11 @@ jobs:
           name: connecso-client-v${{ steps.app_version.outputs.version }}-build-${{ steps.app_version.outputs.build_number }}-android-universal-${{ steps.app_version.outputs.short_sha }}
           path: dist/*-universal-release.apk
           if-no-files-found: error
+      - name: Reset Flutter build watchers
+        shell: bash
+        run: |
+          flutter clean
+          rm -rf android/.gradle build
       - name: Build Android ABI APKs
         run: >-
           timeout 20m flutter build apk --release --split-per-abi --no-shrink
