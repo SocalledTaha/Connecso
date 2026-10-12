@@ -76,7 +76,25 @@ class SubscriptionRepository {
   }) => _refresh(
     endpoint,
     subscriptionId: subscriptionId,
-    fetcher: _directFetcher ?? _fetchWithClient,
+    fetcher: _directFetcher == null
+        ? _fetchWithClient
+        : (uri) async {
+            try {
+              return await _directFetcher!(uri);
+            } catch (error, stackTrace) {
+              // The Android underlying-network bridge is preferred so a
+              // connected VPN cannot intercept subscription refreshes. Some
+              // vendor ROMs can reject that bridge intermittently; importing
+              // must still work through the normal HTTPS client when the
+              // device is disconnected or the bridge is unavailable.
+              developer.log(
+                'event=subscription.direct_fetch_fallback error=$error',
+                name: 'CONNECSO/SUBSCRIPTION',
+                stackTrace: stackTrace,
+              );
+              return _fetchWithClient(uri);
+            }
+          },
   );
 
   /// Fetches through the process' current route. When Connecso is active,
