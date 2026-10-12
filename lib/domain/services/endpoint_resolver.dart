@@ -128,7 +128,7 @@ class EndpointResolver {
     // already carried traffic.
     final immediateIsVerified =
         immediate != null &&
-        immediate.lastSuccess != null &&
+        immediate.authoritativeLatency != null &&
         (immediate.runtimeState == RuntimeHealthState.healthy ||
             immediate.health == NodeHealth.healthy);
     if (immediateIsVerified) {
