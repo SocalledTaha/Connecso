@@ -163,6 +163,7 @@ jobs:
             "dist/connecso-client-v${{ steps.app_version.outputs.version }}-universal-release.apk"
       - uses: actions/upload-artifact@v7
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        continue-on-error: true
         with:
           name: connecso-client-v${{ steps.app_version.outputs.version }}-build-${{ steps.app_version.outputs.build_number }}-android-universal-${{ steps.app_version.outputs.short_sha }}
           path: dist/*-universal-release.apk
@@ -220,6 +221,7 @@ jobs:
           verify_apk "dist/connecso-client-v${{ steps.app_version.outputs.version }}-x86_64-release.apk"
       - uses: actions/upload-artifact@v7
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        continue-on-error: true
         with:
           name: connecso-client-v${{ steps.app_version.outputs.version }}-build-${{ steps.app_version.outputs.build_number }}-android-abi-${{ steps.app_version.outputs.short_sha }}
           path: |
@@ -229,12 +231,14 @@ jobs:
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        continue-on-error: true
         with:
           name: connecso-client-changelog-v${{ steps.app_version.outputs.version }}-build-${{ steps.app_version.outputs.build_number }}-${{ steps.app_version.outputs.short_sha }}
           path: CHANGELOG.md
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        continue-on-error: true
         with:
           name: connecso-client-build-provenance
           path: |
