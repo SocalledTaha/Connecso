@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "cities": [
+    {"country":"Germany","countryCode":"DE","city":"Frankfurt","latitude":50.1109,"longitude":8.6821},
+    {"country":"Netherlands","countryCode":"NL","city":"Amsterdam","latitude":52.3676,"longitude":4.9041},
+    {"country":"United Kingdom","countryCode":"GB","city":"London","latitude":51.5072,"longitude":-0.1276},
+    {"country":"France","countryCode":"FR","city":"Paris","latitude":48.8566,"longitude":2.3522},
+    {"country":"Turkey","countryCode":"TR","city":"Istanbul","latitude":41.0082,"longitude":28.9784},
+    {"country":"United States","countryCode":"US","city":"New York","latitude":40.7128,"longitude":-74.0060},
+    {"country":"Italy","countryCode":"IT","city":"Milan","latitude":45.4642,"longitude":9.1900},
+    {"country":"Poland","countryCode":"PL","city":"Warsaw","latitude":52.2297,"longitude":21.0122},
+    {"country":"Finland","countryCode":"FI","city":"Helsinki","latitude":60.1699,"longitude":24.9384},
+    {"country":"Japan","countryCode":"JP","city":"Tokyo","latitude":35.6762,"longitude":139.6503},
+    {"country":"Canada","countryCode":"CA","city":"Toronto","latitude":43.6532,"longitude":-79.3832}
+  ]
+}

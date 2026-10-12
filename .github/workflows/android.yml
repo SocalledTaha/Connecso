@@ -1,0 +1,261 @@
+name: Android CI
+
+on:
+  push:
+    branches: ["main", "codex/**"]
+    tags: ["v*"]
+    paths-ignore:
+      - "README.md"
+      - "**/*.md"
+      - "docs/**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Identify app and artifact version
+        id: app_version
+        shell: bash
+        run: |
+          version_line="$(sed -n 's/^version: //p' pubspec.yaml | head -n 1 | tr -d '\"')"
+          app_version="${version_line%%+*}"
+          test -n "$app_version"
+          echo "version=$app_version" >> "$GITHUB_OUTPUT"
+          echo "build_number=$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.47.5"
+          cache: true
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+          cache-dependency-path: |
+            pubspec.lock
+            pubspec.yaml
+            tool/bootstrap_android.py
+      - name: Reclaim runner disk space for Android build
+        shell: bash
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/android/sdk/ndk
+          docker system prune --all --force || true
+          sudo apt-get clean
+          df -h /
+      - name: Fetch pinned libXray build scripts
+        shell: bash
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/XTLS/libXray.git work/libXray
+          git -C work/libXray fetch --depth 1 origin 50b95979f5db551bd273165cf469e5daaf791341
+          git -C work/libXray sparse-checkout init --cone
+          git -C work/libXray sparse-checkout set build
+          git -C work/libXray checkout --detach 50b95979f5db551bd273165cf469e5daaf791341
+          test "$(git -C work/libXray rev-parse HEAD)" = "50b95979f5db551bd273165cf469e5daaf791341"
+      - name: Identify libXray build scripts
+        id: libxray_script
+        shell: bash
+        run: |
+          script_hash="$(cd work/libXray && find build -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d ' ' -f 1)"
+          echo "hash=$script_hash" >> "$GITHUB_OUTPUT"
+      - name: Restore pinned libXray AAR cache
+        id: libxray_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: work/artifacts/libXray.aar
+          key: >-
+            ${{ runner.os }}-libxray-50b95979f5db551bd273165cf469e5daaf791341-go-1.27.1-java-17-api24-gomobile-v0.0.0-20260908204917-8b95e45f8d3e-ndk-27.2.12479018-build-${{ steps.libxray_script.outputs.hash }}
+      - name: Verify cached libXray AAR
+        if: steps.libxray_cache.outputs.cache-hit == 'true'
+        run: test -s work/artifacts/libXray.aar
+      - uses: actions/setup-go@v6
+        if: steps.libxray_cache.outputs.cache-hit != 'true'
+        with:
+          go-version: "1.27.1"
+          cache: false
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+      - name: Install Android NDK
+        run: sdkmanager "ndk;27.2.12479018"
+      - name: Pin Android NDK environment
+        shell: bash
+        run: |
+          ndk="$ANDROID_HOME/ndk/27.2.12479018"
+          test -f "$ndk/meta/platforms.json"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ndk" >> "$GITHUB_ENV"
+      - name: Build pinned libXray Android binding
+        if: steps.libxray_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          git -C work/libXray sparse-checkout disable
+          cd work/libXray
+          LIBXRAY_GOMOBILE_VERSION=v0.0.0-20260908204917-8b95e45f8d3e python3 build/main.py android
+          test -s libXray.aar
+          mkdir -p "$GITHUB_WORKSPACE/work/artifacts"
+          cp libXray.aar "$GITHUB_WORKSPACE/work/artifacts/libXray.aar"
+          test -s "$GITHUB_WORKSPACE/work/artifacts/libXray.aar"
+          go clean -cache -modcache -testcache
+      - name: Save pinned libXray AAR cache
+        if: steps.libxray_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: work/artifacts/libXray.aar
+          key: >-
+            ${{ runner.os }}-libxray-50b95979f5db551bd273165cf469e5daaf791341-go-1.27.1-java-17-api24-gomobile-v0.0.0-20260908204917-8b95e45f8d3e-ndk-27.2.12479018-build-${{ steps.libxray_script.outputs.hash }}
+      - name: Remove libXray source checkout
+        if: always()
+        run: rm -rf work/libXray
+      - name: Build pinned HEV API 24 Android runtime
+        run: python tool/build_hev_android.py
+      - run: flutter create --platforms android --org com.connecso --project-name connecso_client .
+      - run: python tool/bootstrap_android.py
+      - name: Restore permanent Android signing key
+        shell: bash
+        env:
+          CONNECSO_KEYSTORE_BASE64: ${{ secrets.CONNECSO_KEYSTORE_BASE64 }}
+          CONNECSO_KEYSTORE_PASSWORD: ${{ secrets.CONNECSO_KEYSTORE_PASSWORD }}
+          CONNECSO_KEY_ALIAS: ${{ secrets.CONNECSO_KEY_ALIAS }}
+          CONNECSO_KEY_PASSWORD: ${{ secrets.CONNECSO_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$CONNECSO_KEYSTORE_BASE64"
+          test -n "$CONNECSO_KEYSTORE_PASSWORD"
+          test -n "$CONNECSO_KEY_ALIAS"
+          test -n "$CONNECSO_KEY_PASSWORD"
+          keystore="$RUNNER_TEMP/connecso-release.jks"
+          printf '%s' "$CONNECSO_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          chmod 600 "$keystore"
+          test -s "$keystore"
+          keytool -list -keystore "$keystore" \
+            -storepass "$CONNECSO_KEYSTORE_PASSWORD" \
+            -alias "$CONNECSO_KEY_ALIAS" > /dev/null
+          {
+            echo "CONNECSO_KEYSTORE_FILE=$keystore"
+            echo "CONNECSO_KEYSTORE_PASSWORD=$CONNECSO_KEYSTORE_PASSWORD"
+            echo "CONNECSO_KEY_ALIAS=$CONNECSO_KEY_ALIAS"
+            echo "CONNECSO_KEY_PASSWORD=$CONNECSO_KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+      - run: flutter pub get
+      - run: flutter analyze --no-fatal-infos --no-fatal-warnings
+      - name: Install SQLite test dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-0 libsqlite3-dev
+      - run: flutter test
+      - name: Build Android universal APK
+        run: >-
+          timeout 20m flutter build apk --release --no-shrink
+          --build-name=${{ steps.app_version.outputs.version }}
+          --build-number=${{ steps.app_version.outputs.build_number }}
+      - name: Rename universal APK
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-release.apk \
+            "dist/connecso-client-v${{ steps.app_version.outputs.version }}-universal-release.apk"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          name: connecso-client-v${{ steps.app_version.outputs.version }}-build-${{ steps.app_version.outputs.build_number }}-android-universal-${{ steps.app_version.outputs.short_sha }}
+          path: dist/*-universal-release.apk
+          if-no-files-found: error
+      - name: Build Android ABI APKs
+        run: >-
+          timeout 20m flutter build apk --release --split-per-abi --no-shrink
+          --build-name=${{ steps.app_version.outputs.version }}
+          --build-number=${{ steps.app_version.outputs.build_number }}
+      - name: Rename ABI APKs
+        shell: bash
+        run: |
+          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk \
+            "dist/connecso-client-v${{ steps.app_version.outputs.version }}-armeabi-v7a-release.apk"
+          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
+            "dist/connecso-client-v${{ steps.app_version.outputs.version }}-arm64-v8a-release.apk"
+          cp build/app/outputs/flutter-apk/app-x86_64-release.apk \
+            "dist/connecso-client-v${{ steps.app_version.outputs.version }}-x86_64-release.apk"
+      - name: Verify release APK signatures
+        shell: bash
+        env:
+          EXPECTED_SIGNING_SHA256: ${{ vars.CONNECSO_SIGNING_SHA256 }}
+        run: |
+          set -euo pipefail
+          apksigner="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          test -x "$apksigner"
+          verify_apk() {
+            local apk="$1"
+            local report digest expected
+            report="$(mktemp)"
+            "$apksigner" verify --verbose --print-certs "$apk" > "$report"
+            if grep -Eiq 'Android Debug|CN=Android Debug' "$report"; then
+              echo "Release APK is signed with an Android debug certificate: $apk" >&2
+              rm -f "$report"
+              exit 1
+            fi
+            digest="$(awk -F': ' '/certificate SHA-256 digest/ {print $2; exit}' "$report" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+            test -n "$digest"
+            expected="$(printf '%s' "${EXPECTED_SIGNING_SHA256:-}" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+            if [[ -n "$expected" && "$digest" != "$expected" ]]; then
+              echo "Unexpected release certificate for $apk" >&2
+              rm -f "$report"
+              exit 1
+            fi
+            if [[ -z "$expected" ]]; then
+              echo "Signing certificate digest (base64): $(printf '%s' "$digest" | base64 -w0)"
+            else
+              echo "Verified signing certificate SHA-256 for $apk"
+            fi
+            rm -f "$report"
+          }
+          verify_apk "dist/connecso-client-v${{ steps.app_version.outputs.version }}-universal-release.apk"
+          verify_apk "dist/connecso-client-v${{ steps.app_version.outputs.version }}-armeabi-v7a-release.apk"
+          verify_apk "dist/connecso-client-v${{ steps.app_version.outputs.version }}-arm64-v8a-release.apk"
+          verify_apk "dist/connecso-client-v${{ steps.app_version.outputs.version }}-x86_64-release.apk"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          name: connecso-client-v${{ steps.app_version.outputs.version }}-build-${{ steps.app_version.outputs.build_number }}-android-abi-${{ steps.app_version.outputs.short_sha }}
+          path: |
+            dist/connecso-client-v${{ steps.app_version.outputs.version }}-armeabi-v7a-release.apk
+            dist/connecso-client-v${{ steps.app_version.outputs.version }}-arm64-v8a-release.apk
+            dist/connecso-client-v${{ steps.app_version.outputs.version }}-x86_64-release.apk
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          name: connecso-client-changelog-v${{ steps.app_version.outputs.version }}-build-${{ steps.app_version.outputs.build_number }}-${{ steps.app_version.outputs.short_sha }}
+          path: CHANGELOG.md
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          name: connecso-client-build-provenance
+          path: |
+            pubspec.lock
+            work/artifacts/libXray.aar
+            work/artifacts/hev-socks5-tunnel.aar
+          if-no-files-found: error
+      - name: Publish GitHub Release APKs
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Connecso ${{ steps.app_version.outputs.version }}
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            dist/connecso-client-v${{ steps.app_version.outputs.version }}-universal-release.apk
+            dist/connecso-client-v${{ steps.app_version.outputs.version }}-armeabi-v7a-release.apk
+            dist/connecso-client-v${{ steps.app_version.outputs.version }}-arm64-v8a-release.apk
+            dist/connecso-client-v${{ steps.app_version.outputs.version }}-x86_64-release.apk
+      - name: Remove restored signing key
+        if: always()
+        shell: bash
+        run: rm -f "${CONNECSO_KEYSTORE_FILE:-}"

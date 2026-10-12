@@ -1,0 +1,7 @@
+CONNECSO Client third-party notices
+
+Contun tunnel engine integration contains software based on zeptun v1.1.2
+(commit 9b09531f35c9fefe3482d3bbe430ab7e2599805a).
+Copyright (c) 2026 Noisemux. Licensed under the MIT License.
+The complete license text is included in third_party/licenses/zeptun-LICENSE.txt
+and in the packaged Android assets.

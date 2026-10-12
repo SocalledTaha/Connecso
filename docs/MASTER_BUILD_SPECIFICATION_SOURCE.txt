@@ -1,0 +1,12 @@
+The original multi-block specification is superseded by the current Android-only,
+Xray-only architecture and implementation requirements. This historical source
+was removed because its retired core requirements conflicted with the approved
+architecture update.
+
+Current source of truth:
+
+- `ARCHITECTURE.md`
+- `CORE_ARCHITECTURE.md`
+- `PROJECT_STATE.md`
+- `docs/IMPLEMENTATION_SCOPE.md`
+- `docs/UI_SPECIFICATION.md`

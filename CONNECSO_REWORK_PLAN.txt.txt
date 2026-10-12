@@ -1,0 +1,2016 @@
+CONNECSO CLIENT — TWO-PHASE REWORK PLAN
+========================================
+
+IMPORTANT:
+Read this entire specification before changing any code.
+
+Do NOT start implementing after reading only the first sections.
+First inspect the existing project, understand the current architecture, locate the relevant implementations, and build an internal checklist covering every requirement below.
+
+This is an existing Android VPN client project.
+Do NOT rewrite the application from scratch.
+Do NOT replace working architecture unless technically required.
+Do NOT remove existing features merely because they cause build/runtime problems.
+
+Most importantly:
+
+NEVER "fix" a regression by:
+- disabling the feature,
+- commenting it out,
+- bypassing it,
+- returning early,
+- replacing it with a stub,
+- swallowing exceptions,
+- hardcoding fake success,
+- removing callbacks,
+- removing UI functionality,
+- setting feature flags to false,
+- silently falling back to a reduced implementation.
+
+If a feature is broken, trace the intended behavior and FIX the actual problem.
+
+There is already a safe baseline:
+- current source exists locally,
+- current state has already been pushed to GitHub,
+- current APK also exists.
+
+DO NOT create another backup before starting.
+
+WORKFLOW
+========
+
+Execute the project in TWO consecutive phases.
+
+PHASE 1:
+UI fixes + UX fixes + theme/language behavior + IPv6 baseline correction.
+
+After Phase 1:
+1. run all relevant tests/checks,
+2. build an Android APK successfully,
+3. preserve that APK as the Phase 1 test build,
+4. DO NOT wait for user confirmation,
+5. continue immediately to Phase 2.
+
+PHASE 2:
+Core behavior + persistence + subscription lifecycle + ping engine + server scoring +
+health monitoring + degradation detection + DEAD-state handling + automatic switching +
+DNS/UDP/Xray baseline corrections.
+
+After Phase 2:
+1. run all relevant tests/checks,
+2. build another Android APK,
+3. preserve it separately as the final Core test build.
+
+Do NOT overwrite the Phase 1 APK with the Phase 2 APK.
+
+Use clear output names similar to:
+
+CONNECSO-ui-ipv6-test.apk
+CONNECSO-core-test.apk
+
+Do not stop after Phase 1 unless the build cannot be completed because of an actual blocking
+technical problem.
+
+======================================================================
+CURRENT CORE ARCHITECTURE — DO NOT IGNORE
+======================================================================
+
+Current packet path is approximately:
+
+Android VpnService TUN
+    ↓
+HEV tun2socks
+    ↓
+SOCKS5 127.0.0.1:10808
+    ↓
+Xray
+    ↓
+selected VPN node
+
+Current known relevant project areas include:
+
+lib/domain/services/xray_config_builder.dart
+android-host/src/main/kotlin/com/connecso/client/ConnecsoVpnService.kt
+lib/platform/android/android_vpn_adapter.dart
+lib/domain/services/connection_manager.dart
+
+Do not assume these are the only relevant files.
+Trace the actual current implementation.
+
+Current core versions documented in the project:
+
+Xray: v26.9.9
+HEV tun2socks: 2.18.0
+
+The Xray outbound may represent:
+- VLESS
+- VMess
+- Trojan
+- Shadowsocks
+
+Existing transport support may include:
+- TCP
+- WebSocket
+- gRPC
+- HTTP Upgrade
+- XHTTP
+- TLS
+- Reality
+
+VpnService.protect() is already part of the architecture and must continue preventing Xray
+outbound sockets from looping back into the VPN.
+
+======================================================================
+PHASE 1 — UI / UX / IPV6
+======================================================================
+
+Do NOT implement the new Ping/AutoSwitcher engine during Phase 1.
+
+Phase 1 must be independently buildable.
+
+----------------------------------------------------------------------
+1. HOME SCREEN — FIX THE UPPER LAYOUT / ANCHORING
+----------------------------------------------------------------------
+
+There is a major layout regression.
+
+Currently the entire Home UI from the CONNECT button upward can scroll upward and disappear
+outside the viewport.
+
+This includes:
+- upper buttons,
+- upper options,
+- map area,
+- connection area around the map,
+- Connect control area.
+
+This is incorrect.
+
+The upper Home section must belong to an anchored/persistent screen region and must NOT be
+able to scroll completely out of the viewport.
+
+Do not "fix" this using arbitrary padding or oversized minHeight values.
+
+Inspect the actual parent layout and scrolling structure.
+
+The intended conceptual layout is:
+
+FIXED / ANCHORED HOME REGION
+    upper controls
+    options
+    map / map watermark
+    Connect area
+
+SCROLLABLE REGION
+    only content that is intentionally designed to scroll below that area
+
+If overlap is visually needed, the map is allowed to extend slightly behind the Connect area
+or slightly underneath adjacent UI.
+
+The goal is visual stability, not a rigid rectangular clipping layout.
+
+----------------------------------------------------------------------
+2. HOME MAP — SIZE / WATERMARK / DESTINATION DISPLAY
+----------------------------------------------------------------------
+
+The current map is too small and floats awkwardly in a large empty area.
+
+The map must fill the central Home region much more naturally.
+
+Requirements:
+
+- width should visually fill nearly the entire usable center area,
+- scale it appropriately for phone width,
+- use it as a background/watermark-style decorative layer while the interactive functionality
+  is incomplete,
+- keep opacity subtle enough that UI remains readable,
+- anchor it within the Home region,
+- do not leave a tiny map in the middle of a huge empty area,
+- it may extend underneath the Connect control if visually appropriate.
+
+Do NOT remove the existing interactive-map architecture if one exists.
+
+The map previously had behavior where connection to a server could identify/focus the
+destination. That functionality appears to have regressed.
+
+Trace the existing implementation before replacing anything.
+
+Desired future behavior:
+
+DISCONNECTED
+    world overview
+
+CONNECTING
+    potentially animate/focus toward destination
+
+CONNECTED
+    identify destination country
+
+However, for this task it is acceptable for the map itself to remain a watermark if restoring
+full interaction safely requires more work.
+
+In that case implement the destination popup described below.
+
+----------------------------------------------------------------------
+3. CONNECTED DESTINATION POPUP
+----------------------------------------------------------------------
+
+When connected, the application currently fails to clearly identify the destination node/country,
+even though subscription nodes already contain recognizable names/flags/country metadata.
+
+Restore destination metadata propagation.
+
+The source of truth should be the actual connected subscription node, NOT a new external IP
+geolocation lookup if node metadata already provides the country.
+
+Expected data flow conceptually:
+
+Subscription Node
+    ↓
+Selected Node
+    ↓
+Connection Manager
+    ↓
+Actual connected Xray outbound
+    ↓
+Active Connected Node state
+    ↓
+UI
+
+The UI needs only the destination COUNTRY.
+
+City is NOT needed.
+
+Examples:
+
+🇩🇪 Germany
+
+or Persian locale:
+
+🇩🇪 آلمان
+
+Do not clutter this popup with:
+- server IP,
+- protocol,
+- port,
+- city,
+- subscription name,
+- upload/download,
+- large diagnostic details.
+
+Visual style:
+- compact floating popup/card,
+- polished rounded shape,
+- theme-aware,
+- compatible with light/dark theme,
+- subtle border/glow according to app accent style,
+- visually similar to a modern network-map tooltip.
+
+If the map is operational, this popup may be positioned relative to the destination/map marker.
+
+If the interactive map is not operational, display the popup cleanly over/near the watermark
+map region.
+
+Country must come from connected node metadata / existing country detection used by the
+subscription-node list.
+
+----------------------------------------------------------------------
+4. EMPTY / FIRST SUBSCRIPTION SCREEN — BOTTOM ANCHOR
+----------------------------------------------------------------------
+
+When the user has no subscription, the first screen currently contains:
+
+"برای شروع اشتراک خود را وارد کنید"
+
+and the two actions:
+
+"وارد کردن لینک از کلیپ بورد"
+"اسکن QR"
+
+Anchor this entire block toward the bottom of the screen.
+
+It must NOT sit at the absolute lowest physical edge.
+
+Leave comfortable spacing above the system gesture/navigation safe area.
+
+Conceptually approximately:
+24–40dp above the safe bottom area, adapted appropriately to the existing design system.
+
+It should visually remain in a stable lower region across phone sizes.
+
+----------------------------------------------------------------------
+5. SUBSCRIPTION MENU — LIVE REACTIVE UPDATE
+----------------------------------------------------------------------
+
+Current bug:
+
+When at least one subscription already exists and the user adds another subscription,
+the open subscription menu does NOT immediately show the new item.
+
+The user currently has to:
+1. close the menu,
+2. reopen it,
+3. only then see the new subscription.
+
+Fix this properly.
+
+After add/edit/delete:
+
+subscription persistence/state update
+    ↓
+menu observes updated state
+    ↓
+open menu refreshes immediately
+    ↓
+new state appears without closing/reopening
+
+Do not patch this by manually closing and reopening the menu.
+
+The menu should be reactively connected to the actual subscription state/source of truth.
+
+----------------------------------------------------------------------
+6. SUBSCRIPTION MENU — TEXT SIZE
+----------------------------------------------------------------------
+
+Increase ONLY the text size in the subscription popup/menu by approximately 15–20%.
+
+Do NOT enlarge:
+- buttons,
+- icons,
+- containers,
+- row heights unnecessarily,
+- menu shell,
+- touch targets if they are already correct.
+
+The user specifically wants the existing control sizes retained.
+
+Only improve text readability.
+
+----------------------------------------------------------------------
+7. EDIT SUBSCRIPTION HEADER
+----------------------------------------------------------------------
+
+The top row/header must look conceptually like:
+
+Edit Subscription              [COPY ICON]   [AUTO REFRESH TOGGLE]
+
+Important:
+
+- Copy must be icon-only.
+- Auto Refresh must be a toggle-only control.
+- Do NOT write "Copy" next to the copy icon.
+- Do NOT write "Auto Refresh" next to the toggle in the header.
+- Both controls must be placed opposite the "Edit Subscription" title.
+
+Example conceptually:
+
+┌──────────────────────────────────────────────┐
+│ Edit Subscription             [📋]      [●] │
+└──────────────────────────────────────────────┘
+
+Use the actual existing icon system/theme rather than emoji.
+
+The subscription URL field may remain elsewhere in the form.
+
+----------------------------------------------------------------------
+8. SUBSCRIPTION AUTO-REFRESH UI
+----------------------------------------------------------------------
+
+Each subscription must have Auto Refresh configuration.
+
+Default policy:
+
+ACTIVE subscription:
+    Auto Refresh = ON
+    interval = 6 hours
+
+OTHER / INACTIVE subscriptions:
+    Auto Refresh = ON
+    interval = 12 hours
+
+The user must be able to:
+- enable/disable automatic refresh for an individual subscription,
+- configure its refresh interval.
+
+The interval control should exist in the Edit Subscription screen.
+
+Do NOT add excessive UI complexity.
+
+The header toggle represents whether auto-refresh for that subscription is enabled.
+
+Changing active subscription changes the effective active/inactive refresh behavior.
+
+Exact lifecycle/persistence logic will be completed in Phase 2.
+
+In Phase 1, implement the correct UI and data model support without destroying existing
+subscription behavior.
+
+----------------------------------------------------------------------
+9. SPLIT TUNNELING — SIMPLIFY TO TWO-STATE UI
+----------------------------------------------------------------------
+
+The old three states were roughly:
+
+Off
+Use Proxy
+Bypass
+
+Remove this confusing three-mode presentation.
+
+The new UI concept is:
+
+"برنامه‌های انتخاب‌شده از VPN استفاده نمی‌کنند."
+
+Place one master toggle on the opposite side of this sentence.
+
+Meaning:
+
+Toggle OFF:
+    Split Tunneling disabled.
+
+Toggle ON:
+    applications checked in the list BYPASS the VPN.
+
+Existing controls below remain:
+
+"انتخاب همه"
+"معکوس"
+"پاک کردن انتخاب‌ها"
+
+Then the application list.
+
+Do not introduce a second Include mode.
+
+The "معکوس" / Revert Checkmarks function already allows users to invert the checked set easily.
+
+----------------------------------------------------------------------
+10. SPLIT TUNNELING — SAVE / CANCEL ON EXIT
+----------------------------------------------------------------------
+
+Changes to selected apps and the master toggle must not silently disappear.
+
+If the user modified Split Tunneling state and attempts to leave using any relevant back action:
+
+- app UI back button,
+- Android system back,
+- Android back gesture / predictive back gesture if applicable,
+- swipe-back behavior if supported,
+
+show a confirmation dialog before leaving.
+
+Persian conceptual text:
+
+"تغییرات ذخیره شوند؟"
+
+Actions:
+
+"ذخیره"
+    persist all checked applications + master toggle state
+    then leave the page
+
+"لغو"
+    discard changes made during this editing session
+    then leave the page
+
+The exact localization should integrate with the existing localization system.
+
+Do NOT intercept back only for one visual Back button.
+System/back-gesture behavior must also be handled.
+
+----------------------------------------------------------------------
+11. POPUP MENU "..." — FIRST TAP MUST NOT BE LOST
+----------------------------------------------------------------------
+
+Current UX bug:
+
+When the top "..." popup menu is open and the user taps a control outside the menu:
+
+First tap:
+    only closes the menu
+
+Second tap:
+    finally activates the control
+
+This is undesirable.
+
+Desired behavior:
+
+If user taps empty/noninteractive area:
+    dismiss the popup only
+
+If user taps an interactive element underneath/outside the popup:
+    dismiss popup
+    AND execute the intended tap exactly once
+
+Examples:
+- checkbox should toggle,
+- button should execute,
+- row should activate.
+
+Do not create accidental double execution.
+
+Implement the correct framework-native pointer/event behavior if possible instead of brittle
+manual coordinate forwarding.
+
+----------------------------------------------------------------------
+12. LANGUAGE DEFAULT BEHAVIOR
+----------------------------------------------------------------------
+
+Only Persian and English are currently supported.
+
+Initial/default language behavior:
+
+If device/system locale language is Persian:
+    app language = Persian
+
+For EVERY OTHER system language:
+    app language = English
+
+Examples:
+Arabic → English
+Turkish → English
+French → English
+German → English
+Azerbaijani → English
+etc.
+
+If there is an explicit saved user language preference, that preference may override automatic
+initial detection according to the current settings design.
+
+Do not add unsupported languages.
+
+----------------------------------------------------------------------
+13. THEME BEHAVIOR — IMPORTANT UI REQUIREMENT
+----------------------------------------------------------------------
+
+DO NOT add a third visible option called:
+- System
+- System Default
+- Follow System
+- Automatic
+
+The visible Theme UI must contain ONLY TWO choices:
+
+Light
+Dark
+
+However, internally, the app must support system-theme synchronization.
+
+Desired behavior is similar conceptually to Telegram:
+
+Suppose the system is currently Dark.
+
+UI can represent:
+
+Dark — synchronized with phone
+Light
+
+If the device later changes to Light while system synchronization is active:
+
+the app automatically switches to Light
+
+and UI now indicates that Light is the theme synchronized with the phone.
+
+There must NOT be a third theme button.
+
+Internal concept may use something equivalent to:
+
+followSystemTheme = true/false
+
+Behavior:
+
+On first launch / no explicit override:
+    follow system theme dynamically.
+
+Example:
+system Dark → app Dark
+system changes Light → app changes Light
+
+If the user manually chooses the opposite theme:
+
+example:
+system Dark
+user chooses Light
+
+then:
+
+followSystemTheme = false
+manualTheme = Light
+
+Future system changes should NOT change the app.
+
+To restore synchronization:
+
+If the user selects the theme that currently matches the phone/system theme,
+it may re-enable followSystemTheme.
+
+Example:
+
+system Dark
+app manually Light
+user taps Dark
+→ Dark becomes active
+→ system synchronization resumes
+
+No third visible control.
+
+Persist manual/sync state correctly.
+
+----------------------------------------------------------------------
+14. IPV6 BASELINE
+----------------------------------------------------------------------
+
+The current VPN configuration has IPv6 enabled by default.
+
+Existing behavior may include:
+
+TUN IPv4:
+10.111.0.1/30
+
+TUN IPv6:
+fd00::1/126
+
+Routes:
+0.0.0.0/0
+::/0
+
+DNS:
+1.1.1.1
+2606:4700:4700::1111
+
+For the new stable baseline, make the VPN default IPv4-only.
+
+Default Phase 1 behavior:
+
+IPv4:
+ON
+
+IPv6:
+OFF
+
+TUN:
+10.111.0.1/30
+
+Route:
+0.0.0.0/0
+
+VPN DNS:
+1.1.1.1
+
+Remove/disable from the default VPN path:
+- fd00::1/126
+- ::/0
+- 2606:4700:4700::1111
+
+HEV configuration must match the IPv4-only baseline.
+
+Do not leave an IPv6 route/address active in one layer while disabling it in another.
+
+The goal is a coherent IPv4-only baseline across:
+- Android VpnService,
+- HEV,
+- Xray/DNS behavior where appropriate.
+
+This is being done because some large services such as Google/YouTube/Yahoo currently behave
+incorrectly and IPv6 path inconsistency is one suspected factor.
+
+Do NOT add experimental complexity during Phase 1.
+
+----------------------------------------------------------------------
+15. PHASE 1 BUILD
+----------------------------------------------------------------------
+
+When ALL Phase 1 tasks above are implemented:
+
+- format/lint as appropriate,
+- run relevant tests,
+- build Android release/debug APK appropriate for device testing,
+- verify the APK exists,
+- preserve it as a separate Phase 1 build.
+
+Suggested name:
+
+CONNECSO-ui-ipv6-test.apk
+
+Do NOT stop and wait for approval.
+
+Continue immediately to Phase 2.
+
+======================================================================
+PHASE 2 — CORE / PERSISTENCE / PING / AUTOSWITCH
+======================================================================
+
+Before changing Core logic, inspect the current implementation thoroughly.
+
+Do not blindly replace existing working protocol-generation logic.
+
+----------------------------------------------------------------------
+16. MAJOR BUG — PERSISTENT STATE LOSS
+----------------------------------------------------------------------
+
+This is a major unresolved regression.
+
+After closing/reopening the app, user data has disappeared.
+
+Observed affected areas include:
+
+- subscriptions,
+- Split Tunneling selected applications.
+
+Codex previously claimed this problem was fixed, but it is NOT fixed.
+
+Treat this as unresolved until verified through an actual process restart workflow.
+
+Trace the FULL persistence chain:
+
+UI mutation
+    ↓
+state/source of truth
+    ↓
+persistent storage write
+    ↓
+process termination
+    ↓
+app startup
+    ↓
+storage read
+    ↓
+state restoration
+    ↓
+UI rendering
+
+Investigate potential causes including:
+- state existing only in memory/provider,
+- data written but not restored,
+- startup initialization overwriting restored data,
+- changed storage keys,
+- broken migrations,
+- clear()/replace behavior,
+- async restore race,
+- duplicate state stores,
+- stale snapshots,
+- incomplete split-tunnel serialization,
+- subscription metadata stored separately from subscription URL,
+- wrong lifecycle ordering.
+
+Must survive:
+- normal app close/reopen,
+- process kill,
+- force-stop/reopen,
+- Android process recreation.
+
+Persistent user data should include at least:
+
+- Subscription definitions / URLs
+- Subscription names/settings
+- Split Tunneling master state
+- Split Tunneling selected package IDs
+- per-subscription Auto Refresh settings
+- Last Good node
+- persistent server history/weight metadata described later
+- user language/theme preference state
+- relevant user preferences
+
+Do NOT claim this fixed simply because the app compiled.
+
+Verify it behaviorally.
+
+----------------------------------------------------------------------
+17. SUBSCRIPTION REFRESH LIFECYCLE
+----------------------------------------------------------------------
+
+There are TWO concepts:
+
+A. Persistent server history / preference data
+B. Current subscription-cycle availability state
+
+They MUST NOT be treated as the same data.
+
+AUTO REFRESH DEFAULTS:
+
+Active subscription:
+    every 6 hours
+
+Inactive/other subscriptions:
+    every 12 hours
+
+Auto Refresh should default to ON even if the user never manually enables it.
+
+Each subscription may have:
+- autoRefreshEnabled
+- configured refresh interval
+- lastRefreshAt
+- nextRefreshAt
+
+User may customize the interval.
+
+When a subscription becomes Active:
+
+it adopts/effectively uses the Active policy (default 6h).
+
+When it stops being Active:
+
+it returns to the inactive/background policy or its configured background behavior
+(default 12h).
+
+Manual Refresh:
+
+If user manually refreshes a subscription, reset/restart that subscription's refresh timer.
+
+IMPORTANT DATA RESET RULE:
+
+Refreshing the subscription must NOT delete:
+
+- Last Good data,
+- historical server weight/quality metadata,
+- persistent previous-success information,
+- country priority.
+
+Refresh SHOULD reset current availability-cycle information such as:
+
+- DEAD status,
+- current consecutive failure counter,
+- current per-cycle availability state.
+
+The critical rule:
+
+Subscription refresh gives DEAD nodes another chance.
+
+It does NOT wipe the persistent intelligence/history about those nodes.
+
+----------------------------------------------------------------------
+18. NODE IDENTITY
+----------------------------------------------------------------------
+
+Persistent history requires stable node identity.
+
+Do not key historical data only by volatile list index.
+
+Use an appropriate stable identity derived from available subscription/node information,
+for example stable IDs already present in the model, or a deterministic identity based on
+safe node metadata.
+
+A node that still represents the same destination across subscription refresh should retain:
+- Last Good relation if applicable,
+- historical baseline,
+- historical quality metadata.
+
+If the subscription changes the node so significantly that it is no longer the same node,
+do not incorrectly merge histories.
+
+Implement this deliberately.
+
+----------------------------------------------------------------------
+19. NEW REAL PING METHOD
+----------------------------------------------------------------------
+
+The existing ping system is not considered useful enough.
+
+The new primary displayed ping must use a real request through the actual proxy/Xray outbound.
+
+Desired conceptual measurement:
+
+start timer
+    ↓
+request travels through selected node/Xray outbound
+    ↓
+TLS/HTTP exchange
+    ↓
+first valid response byte / response header arrives
+    ↓
+stop timer
+
+Displayed Ping = Real Delay / First Byte latency
+
+Do NOT use:
+- ICMP as the primary displayed value,
+- local SOCKS connect time,
+- localhost proxy-connect time,
+- arbitrary internal socket timing.
+
+Diagnostic values may optionally retain things such as:
+- HTTP status,
+- proxy connect,
+- TLS via outbound,
+- First Byte,
+
+but the primary ping used for user display/scoring is First Byte / Real Delay through the
+actual outbound.
+
+Use a lightweight stable endpoint suitable for connectivity testing, ideally a 204-style
+endpoint, and keep endpoint behavior consistent so server-side processing variance is minimal.
+
+The test MUST actually traverse the node being evaluated.
+
+----------------------------------------------------------------------
+20. INITIAL SERVER SCORING
+----------------------------------------------------------------------
+
+Initial server selection has three primary score components.
+
+A. COUNTRY PRIORITY
+
+Tier/group scores:
+
+50 points:
+- Netherlands
+- Germany
+- United Kingdom
+
+40 points:
+- Turkey
+- France
+- United States
+
+30 points:
+- Canada
+- Italy
+
+Note:
+Turkey is also part of the first connection search Tier even though its Country Score is 40.
+
+Country score is persistent/static configuration, not derived from latency.
+
+B. LAST GOOD
+
+If the node is the previously successful Last Good connection:
+
++20 points
+
+Last Good must persist across:
+- app restart,
+- subscription refresh.
+
+Last Good must NOT be reset by the 6-hour active-subscription refresh.
+
+C. RELATIVE REAL PING SCORE
+
+Maximum:
+40 points
+
+The best currently measured candidate receives:
+40.
+
+Other nodes receive a smooth/proportional score based on how much slower they are relative
+to the best current ping.
+
+Do NOT use crude fixed buckets.
+
+Desired behavior concept:
+
+best = 100ms → 40
+
+a server approximately 10% slower:
+approximately 10% less Ping Score
+
+a server approximately 20% slower:
+approximately 20% less Ping Score
+
+etc.
+
+Use a safe bounded continuous formula.
+
+A reasonable implementation basis can be proportional/ratio based, but verify its behavior
+for large differences and do not produce negative values.
+
+The algorithm must still work when the USER'S ENTIRE INTERNET IS BAD.
+
+Example:
+
+A = 300ms
+B = 330ms
+C = 380ms
+D = 450ms
+
+A is still the best current candidate and should receive full/near-full ping preference,
+rather than treating every node as uniformly useless.
+
+Initial Final Score concept:
+
+FinalScore =
+    CountryPriority
+  + RelativePingScore
+  + LastGoodBonus
+
+Current maximum theoretical score:
+50 + 40 + 20 = 110
+
+The degradation penalty described later is NOT normally part of initial server selection.
+
+----------------------------------------------------------------------
+21. TIERED INITIAL CONNECTION SEARCH
+----------------------------------------------------------------------
+
+Do NOT wait for every server in the subscription before connecting.
+
+Initial search tiers:
+
+TIER 1:
+- Netherlands
+- Germany
+- United Kingdom
+- Turkey
+
+TIER 2:
+- France
+- United States
+
+TIER 3:
+- Canada
+- Italy
+
+When user presses CONNECT:
+
+1. use cached subscription data;
+2. DO NOT refresh subscription simply because Connect was pressed;
+3. remove nodes that are DEAD for the current subscription availability cycle;
+4. probe Tier 1 candidates first;
+5. calculate Real Ping and score viable Tier 1 candidates;
+6. if a sufficiently viable Tier 1 candidate exists, select/connect without waiting for
+   Tier 2 or Tier 3;
+7. expand to Tier 2 only if Tier 1 does not provide a usable candidate;
+8. expand to Tier 3 only if required.
+
+Historical data / Last Good can influence probe order inside the tier.
+
+Example:
+
+If Germany is Last Good and part of Tier 1, probing it early is desirable.
+
+Do NOT wait unnecessarily for:
+- America,
+- Canada,
+- Italy,
+
+when healthy high-priority European candidates are already available.
+
+Parallel/concurrency controlled probing may be used.
+
+Do not probe every node strictly sequentially.
+
+Avoid allowing one timeout node to block the whole Connect operation.
+
+Healthy initial connection target UX should be fast.
+
+With normal real delays around ~90–150ms and healthy candidate nodes, target approximate
+connection startup on the order of roughly 1–2 seconds rather than waiting for all servers.
+
+----------------------------------------------------------------------
+22. NODE RUNTIME STATES
+----------------------------------------------------------------------
+
+Use clear state semantics.
+
+At minimum:
+
+UNKNOWN
+HEALTHY
+DEGRADED
+DEAD
+
+UNKNOWN:
+not yet sufficiently evaluated in the current subscription availability cycle.
+
+HEALTHY:
+responding normally.
+
+DEGRADED:
+still responds, but current quality is significantly worse than baseline / peers.
+
+DEAD:
+repeated hard failures have demonstrated unavailability for this subscription cycle.
+
+Important:
+
+300ms, 500ms, etc. are NOT automatically DEAD if the node still responds.
+
+Slow response = DEGRADED.
+
+No usable response / timeout / connection failure contributes to HARD FAILURE / DEAD logic.
+
+----------------------------------------------------------------------
+23. DEAD NODE POLICY
+----------------------------------------------------------------------
+
+Five consecutive hard failures:
+
+FAIL
+FAIL
+FAIL
+FAIL
+FAIL
+
+→ mark node DEAD for the CURRENT subscription cycle.
+
+Once DEAD:
+
+- exclude from normal ping loop,
+- exclude from initial server selection,
+- exclude from failover candidates,
+- do not waste repeated probes on it.
+
+It stays DEAD until that subscription is refreshed.
+
+On subscription refresh:
+
+DEAD → UNKNOWN
+
+and the node gets another opportunity.
+
+Example:
+
+Italy is physically/offline for hours.
+
+Cycle A:
+5 fails → DEAD → stop probing.
+
+At next subscription refresh:
+Italy → UNKNOWN → gets tested again.
+
+If still offline:
+another 5 failures → DEAD again.
+
+This is intentional.
+
+DEAD is not permanent historical deletion.
+
+----------------------------------------------------------------------
+24. PING HISTORY — KEEP IT LIGHT
+----------------------------------------------------------------------
+
+Do NOT retain unlimited raw ping samples.
+
+For active runtime decision-making, keep only the most recent 5 ping samples per node.
+
+Conceptual node runtime data:
+
+last5Pings
+lastPing
+baselinePing
+consecutiveFailures
+recent spike state
+recent outage state
+node runtime state
+
+Do not create a heavy continuously-growing analytics database.
+
+Long-lived raw histories are unnecessary because active subscription refresh occurs every
+6 hours.
+
+However, important abnormal events may be retained in compact form:
+
+- significant spike events,
+- complete outages,
+- recovery events.
+
+The decision engine should mostly work from:
+- last 5,
+- compact baseline/history,
+- current state.
+
+The analysis must be event-driven, NOT an always-running CPU loop.
+
+----------------------------------------------------------------------
+25. MONITORING PULSE SCHEDULE
+----------------------------------------------------------------------
+
+After connection:
+
+Phase A:
+from connection start until 1 hour:
+    regular monitoring pulse every 1 minute
+
+Phase B:
+after 1 hour:
+    regular monitoring pulse every 10 minutes
+
+Continue the 10-minute interval for long sessions.
+
+Do NOT increase data/storage complexity simply because a connection remains active for
+7+ hours.
+
+Only keep the last 5 runtime ping samples plus compact event/state data.
+
+Regular monitoring schedule is different from Emergency Verification described later.
+
+----------------------------------------------------------------------
+26. GLOBAL NETWORK DEGRADATION VS NODE-SPECIFIC DEGRADATION
+----------------------------------------------------------------------
+
+This distinction is essential.
+
+Do NOT punish the current node simply because its ping became high.
+
+Example — GLOBAL degradation:
+
+DE normally 120 → now 320
+NL normally 110 → now 305
+UK normally 125 → now 330
+TR normally 140 → now 315
+
+This strongly suggests the user's current network/internet condition degraded.
+
+Do NOT apply a node-specific degradation penalty to Germany merely because it is over 300.
+
+Avoid unnecessary server switching.
+
+Example — NODE-SPECIFIC degradation:
+
+DE normally 120 → now 320
+NL 110 → 115
+UK 125 → 130
+TR 140 → 145
+
+Here Germany/path is likely specifically degraded.
+
+Node-specific penalty may apply.
+
+Use comparison against:
+- the current node's baseline,
+- concurrent health of peer candidates,
+- majority/consensus of the other usable nodes.
+
+A practical threshold around 60–70% of other relevant nodes remaining near their own baseline
+may be used as a starting point, but design this robustly and document the exact chosen rule.
+
+The point is:
+
+current node degraded
+AND
+most other nodes stable
+→ node-specific degradation
+
+most nodes degraded together
+→ probable global network degradation
+→ do not penalize/switch aggressively.
+
+----------------------------------------------------------------------
+27. DEGRADATION PENALTY
+----------------------------------------------------------------------
+
+Degradation affects AUTOSWITCH decisions, not normal initial selection.
+
+The user wants scaled negative scores.
+
+Use the node's baseline rather than only universal fixed latency thresholds.
+
+Illustrative desired behavior when baseline is around 110ms:
+
+normal / reasonable drift:
+approximately <=150ms
+→ 0 penalty
+
+moderate degradation:
+~151–200ms
+→ approximately -5
+
+worse:
+~201–250ms
+→ approximately -10
+
+worse:
+~251–299ms
+→ approximately -15
+
+severe:
+300ms+
+→ stronger penalty, e.g. around -25 and increasing if appropriate
+
+very severe but still responding:
+may increase further, e.g. -30 / -35 depending on chosen scaling
+
+Hard failure:
+do not treat as a giant latency penalty;
+it transitions into failure/emergency/dead logic.
+
+IMPORTANT:
+These values should behave as a scalable severity model, not a brittle exact-value table.
+
+If baseline is different, adapt relative to that baseline.
+
+The user's intent:
+
+- degradation should reduce current node preference progressively,
+- 5-point steps are suitable in moderate ranges,
+- once the node reaches ~300ms relative to a normal ~110 baseline, a larger penalty is justified,
+- but penalty applies only when peers show this is node-specific rather than a global network problem.
+
+----------------------------------------------------------------------
+28. EVENT-DRIVEN CONNECTION HEALTH MONITOR
+----------------------------------------------------------------------
+
+Do NOT implement AutoSwitcher as an infinite busy polling analysis loop.
+
+Use an event-driven architecture.
+
+Conceptually:
+
+Probe result
+Xray/core event
+Android underlying network event
+    ↓
+ConnectionHealthMonitor
+    ↓
+health state/event
+    ↓
+AutoSwitcher
+
+Possible health states/events:
+
+HEALTHY
+DEGRADED
+HARD_FAILURE
+DEAD
+
+Behavior:
+
+HEALTHY
+    no action
+
+DEGRADED
+    update scores / evaluate whether switch is justified
+
+HARD_FAILURE
+    trigger Emergency Verification
+
+DEAD
+    remove node from eligible candidate pool until subscription refresh
+
+Triggers must be explicit.
+
+Nothing "automatically happens" unless a real event/condition is defined.
+
+----------------------------------------------------------------------
+29. HARD FAILURE DEFINITION
+----------------------------------------------------------------------
+
+Hard Failure is NOT "ping is high".
+
+Examples of valid Hard Failure signals for CURRENT NODE:
+
+- real outbound probe times out,
+- no usable HTTP response before configured timeout,
+- actual outbound connection fails,
+- TLS/transport cannot establish through current node,
+- Xray/core reports meaningful current outbound/session failure,
+- route is present locally but actual outbound connectivity is unusable.
+
+Examples that are NOT Hard Failure:
+
+300ms response
+500ms response
+slow but valid HTTP response
+
+Those are degraded, not dead.
+
+A single hard failure should trigger emergency verification rather than waiting for the next
+normal one-minute or ten-minute monitoring pulse.
+
+----------------------------------------------------------------------
+30. EMERGENCY VERIFICATION
+----------------------------------------------------------------------
+
+Normal monitoring intervals are too slow for connection failure recovery.
+
+When a current-node Hard Failure occurs:
+
+DO NOT wait:
+- 1 minute,
+- 10 minutes,
+- next scheduled monitoring pulse.
+
+Start a fast emergency verification sequence.
+
+Conceptual behavior:
+
+t = 0:
+normal/current probe hard-fails
+
+→ enter emergency verification
+
+retry current node at short interval,
+approximately 2–3 seconds apart.
+
+A reasonable target:
+
+initial hard failure
++ two fast confirmation retries
+
+Three consecutive fast hard failures total
+→ allow immediate Emergency AutoSwitch
+
+Example:
+
+t=0s    FAIL
+t≈2s    FAIL
+t≈4s    FAIL
+→ switch
+
+This should normally detect a fully broken current route within only a few seconds.
+
+Do not confuse this with DEAD state.
+
+3 fast failures:
+→ switch away from current server
+
+5 consecutive total hard failures:
+→ DEAD
+
+The node may therefore be switched away from before it is permanently excluded for the
+current subscription cycle.
+
+----------------------------------------------------------------------
+31. AUTOSWITCHER
+----------------------------------------------------------------------
+
+AutoSwitcher is separate from the DEAD-state system.
+
+A node may be bad enough to leave but not yet DEAD.
+
+AutoSwitcher must handle:
+
+A. HARD FAILURE SWITCH
+B. NODE-SPECIFIC DEGRADATION SWITCH
+
+Do NOT switch because another server wins by 1–2 points for one moment.
+
+Do NOT create ping-pong switching.
+
+For degradation switch:
+
+- confirm current node degradation,
+- verify peers are not globally degraded,
+- recalculate current score including degradation penalty,
+- identify a genuinely better candidate,
+- require meaningful score advantage,
+- ideally require confirmation across more than one relevant observation unless severity
+  makes immediate action necessary.
+
+A score margin around 10–15 points is a reasonable starting range, but inspect actual score
+distribution and choose/document the final threshold.
+
+Remember scoring ranges:
+
+Country:
+30 / 40 / 50
+
+Ping:
+0..40
+
+Last Good:
++20
+
+Degradation:
+negative when applicable
+
+Example concept:
+
+Current DE:
+Country 50
+LastGood 20
+Current Ping score low
+Degradation -25
+
+Candidate NL:
+Country 50
+Ping score high
+No degradation
+
+If NL is clearly superior → switch.
+
+----------------------------------------------------------------------
+32. AUTOSWITCH COOLDOWN
+----------------------------------------------------------------------
+
+After a normal degradation-based AutoSwitch, use a cooldown to avoid oscillation/ping-pong.
+
+During cooldown:
+minor normal quality differences should not immediately switch again.
+
+Hard Failure must be allowed to override cooldown.
+
+A starting value around 3–5 minutes is reasonable.
+
+Choose/document an exact implementation based on existing timing architecture.
+
+Do NOT allow the app to bounce:
+
+DE → NL → DE → NL
+
+because of small transient differences.
+
+After switching away from a degraded server:
+continue monitoring that old server according to normal eligibility rules unless it becomes DEAD.
+
+If it later recovers:
+do not immediately switch back merely because it is historically preferred.
+
+Current healthy connection stability matters.
+
+----------------------------------------------------------------------
+33. LAST GOOD
+----------------------------------------------------------------------
+
+Last Good bonus:
+
++20
+
+Last Good represents a previously successful, good-quality connection.
+
+It must persist across:
+- process restart,
+- app restart,
+- subscription refresh.
+
+But Last Good is only a preference, not absolute authority.
+
+A node with terrible current quality must not win solely because it is Last Good.
+
+This is why Last Good is 20 rather than the previously considered 35.
+
+----------------------------------------------------------------------
+34. PERSISTENT SERVER HISTORY VS RUNTIME WINDOW
+----------------------------------------------------------------------
+
+Maintain a compact persistent server profile separately from runtime current-cycle state.
+
+PERSISTENT PROFILE may contain:
+
+- stable node identity
+- Last Good
+- historical quality/baseline metadata
+- previous successful connection information
+- country priority
+- compact useful historical intelligence
+
+CURRENT-CYCLE / RUNTIME STATE:
+
+- UNKNOWN / HEALTHY / DEGRADED / DEAD
+- current last5Pings
+- consecutive failures
+- current recent spike/outage status
+- cycle availability state
+
+Subscription refresh must NOT erase the persistent profile.
+
+It MAY reset/rebuild the current availability state.
+
+----------------------------------------------------------------------
+35. DNS / Xray BASELINE
+----------------------------------------------------------------------
+
+Current Xray configuration has been too minimal/inconsistent regarding DNS.
+
+Current known behavior may include:
+- Android DNS 1.1.1.1
+- LibXray.setDNS(this, "1.1.1.1:53")
+- no explicit full DNS routing/hijack in the generated JSON
+- domainStrategy AsIs
+- no DNS outbound
+- no dedicated port-53 rule
+- sniffing absent
+- Mux currently enabled with concurrency 8
+- global UDP/443 blackhole rule exists
+
+The new baseline should combine conservative practices inspired by stable clients such as
+v2rayNG/Hiddify while remaining Xray-native.
+
+DEFAULT Xray baseline:
+
+IPv4:
+ON
+
+IPv6:
+OFF for current stable baseline
+
+SOCKS:
+127.0.0.1:10808
+noauth
+UDP enabled
+
+domainStrategy:
+AsIs
+
+Mux:
+OFF by default
+
+QUIC:
+allowed by default
+
+UDP:
+allowed
+
+REMOVE the global:
+UDP/443 → blackhole
+
+Do NOT globally kill UDP/443 in normal mode.
+
+FakeDNS:
+OFF
+
+Sniffing:
+ON
+
+Recommended sniffing concept:
+
+enabled: true
+routeOnly: true
+destOverride:
+- http
+- tls
+- quic
+
+Use routeOnly so sniffing is useful for routing/metadata without unnecessarily rewriting targets.
+
+----------------------------------------------------------------------
+36. DNS ROUTING
+----------------------------------------------------------------------
+
+Implement explicit Xray DNS handling rather than accidental raw passthrough only.
+
+Conceptual Xray structure:
+
+dns:
+    queryStrategy: UseIPv4
+    servers:
+        1.1.1.1
+        8.8.8.8
+
+inbound:
+    SOCKS 127.0.0.1:10808
+    UDP enabled
+    sniffing enabled
+
+outbounds:
+    proxy
+    direct
+    block
+    dns-out
+
+routing:
+    domainStrategy: AsIs
+
+rule:
+    SOCKS inbound + port 53
+    → dns-out
+
+Conceptual DNS packet flow:
+
+Android
+    ↓
+TUN
+    ↓
+HEV
+    ↓
+SOCKS
+    ↓
+Xray
+    ↓
+port 53 rule
+    ↓
+dns-out
+    ↓
+Xray DNS resolver
+
+Do NOT blindly paste the example JSON if it is incompatible with the currently embedded Xray
+version/API.
+
+Implement it correctly for the actual Xray version used by this app.
+
+Ensure:
+- no DNS loop,
+- VpnService.protect architecture remains correct,
+- DNS does not accidentally leave the tunnel unless intended,
+- config validates.
+
+----------------------------------------------------------------------
+37. OUTBOUND STRUCTURE
+----------------------------------------------------------------------
+
+Retain the selected VPN node as the primary/default outbound.
+
+Also provide:
+
+proxy
+direct
+block
+dns-out
+
+Keep proxy as the primary/default outbound such that normal traffic still goes through VPN.
+
+Do NOT add arbitrary Google/Yahoo direct-bypass rules.
+
+The objective is that Google/YouTube/Yahoo work THROUGH the VPN correctly.
+
+Do not "fix" them by bypassing the VPN.
+
+----------------------------------------------------------------------
+38. UDP / QUIC
+----------------------------------------------------------------------
+
+Current global rule:
+
+UDP destination port 443
+→ blackhole
+
+must be removed from the default configuration.
+
+Default:
+
+UDP ON
+UDP/443 allowed
+QUIC allowed
+
+If a future compatibility mode is desired, that can separately disable QUIC.
+
+Do NOT make QUIC blocking the default.
+
+----------------------------------------------------------------------
+39. MUX
+----------------------------------------------------------------------
+
+Default Mux:
+
+OFF
+
+Do not use:
+enabled=true
+concurrency=8
+
+as universal default.
+
+Do not assume increasing Mux concurrency increases throughput/CPU usage beneficially.
+
+Mux may later be exposed as an advanced option, but the stable baseline is OFF.
+
+----------------------------------------------------------------------
+40. Xray CPU / PERFORMANCE
+----------------------------------------------------------------------
+
+Do NOT implement fake "Maximum CPU" behavior.
+
+Do NOT increase arbitrary:
+- thread counts,
+- mux concurrency,
+- busy loops,
+
+just to make Xray use more CPU.
+
+The current goal is reliability and correct routing.
+
+If performance tuning is performed:
+- use evidence/benchmarking,
+- avoid unnecessary battery use,
+- keep Go/Xray scheduler behavior natural,
+- avoid modifying buffers without a measured reason.
+
+----------------------------------------------------------------------
+41. INITIAL CONNECT FLOW — FINAL EXPECTED BEHAVIOR
+----------------------------------------------------------------------
+
+When user presses Connect:
+
+DO NOT refresh subscription automatically just because Connect was pressed.
+
+Use current cached subscription state.
+
+Flow:
+
+CONNECT
+    ↓
+load current subscription
+    ↓
+exclude DEAD nodes for current cycle
+    ↓
+identify Tier 1 candidates
+    ↓
+real-delay probe viable Tier 1 candidates
+    ↓
+compute relative Ping Score
+    ↓
+add Country Priority
+    ↓
+add Last Good +20 if applicable
+    ↓
+pick highest valid score
+    ↓
+start selected Xray outbound
+    ↓
+start/attach HEV + Android VPN
+    ↓
+verify actual connection
+    ↓
+CONNECTED
+    ↓
+update activeConnectedNode
+    ↓
+update destination country UI
+    ↓
+if quality is acceptable, update Last Good
+    ↓
+start monitoring schedule
+
+Only expand to Tier 2/Tier 3 if needed.
+
+Do not wait for low-priority servers without reason.
+
+----------------------------------------------------------------------
+42. MONITORING FLOW — FINAL EXPECTED BEHAVIOR
+----------------------------------------------------------------------
+
+CONNECTED
+    ↓
+monitoring pulse schedule
+
+0–1h:
+every 1 minute
+
+1h+:
+every 10 minutes
+
+Each pulse:
+    gather new Real Ping / failure result
+    ↓
+update node's rolling last-5 window
+    ↓
+update compact baseline/current state
+    ↓
+detect anomaly
+    ↓
+compare current node degradation against peers
+    ↓
+emit health event
+    ↓
+AutoSwitcher decides whether action is needed
+
+No busy loop.
+
+No continuous CPU-heavy analytics.
+
+----------------------------------------------------------------------
+43. IMPORTANT REGRESSION AUDIT
+----------------------------------------------------------------------
+
+There are signs that previous fixes may have disabled broken features rather than repairing them.
+
+Audit relevant project code for suspicious patterns around the affected features, including:
+
+TODO
+FIXME
+temporary
+disabled
+fallback
+return null
+return false
+empty catch blocks
+catch (_) {}
+silently swallowed exceptions
+feature flag false
+commented callbacks
+unused replacement implementations
+duplicated old/new state handlers
+dead code paths
+early return bypasses
+
+Especially inspect:
+
+- subscription persistence,
+- Split Tunneling persistence,
+- active connected node propagation,
+- connected-country/map state,
+- geolocation/country metadata,
+- subscription refresh,
+- ConnectionManager,
+- Xray config generation,
+- Android VPN adapter/service,
+- ping/probe engine.
+
+Do not delete code merely because it appears unused until you have traced whether it represents
+a broken/abandoned implementation of required behavior.
+
+----------------------------------------------------------------------
+44. VALIDATION REQUIREMENTS
+----------------------------------------------------------------------
+
+Do not declare a feature fixed simply because compilation succeeds.
+
+Validate behavior.
+
+At minimum verify:
+
+PERSISTENCE:
+- add subscription
+- close app/process
+- reopen
+- subscription still exists
+
+SPLIT TUNNEL:
+- change selected apps
+- leave through back gesture
+- confirmation appears
+- save
+- restart app
+- choices remain
+
+SUB MENU:
+- add subscription while menu flow is active
+- new subscription appears immediately
+
+THEME:
+- no System third option exists
+- only Light/Dark visible
+- initial/system-follow behavior works
+- manual override works
+
+LANGUAGE:
+- Persian system → Persian
+- non-Persian system → English
+
+MAP/DESTINATION:
+- connection updates actual connected node metadata
+- correct country appears in popup
+
+IPV6 BASELINE:
+- VPN defaults to IPv4-only
+- no stray IPv6 TUN route/address remains
+
+GOOGLE-CLASS SERVICES:
+- test Google
+- YouTube
+- Yahoo
+- general websites
+
+DNS:
+- resolution works through expected path
+
+UDP:
+- UDP not globally killed by UDP/443 blackhole
+
+PING:
+- Real Delay reflects actual outbound HTTP/TLS first-byte behavior
+
+SCORING:
+- country + ping + Last Good behaves as specified
+
+DEAD:
+- 5 failures → DEAD
+- stops ordinary probing
+- refresh → UNKNOWN
+
+AUTOSWITCH:
+- node-specific severe degradation may switch
+- global network degradation should NOT cause unnecessary switching
+- hard failure triggers emergency verification immediately
+
+----------------------------------------------------------------------
+45. PHASE 2 BUILD
+----------------------------------------------------------------------
+
+When all Phase 2 tasks are complete:
+
+- format/lint,
+- run relevant tests,
+- run config validation,
+- build the Android APK,
+- preserve separately from Phase 1.
+
+Suggested output:
+
+CONNECSO-core-test.apk
+
+Do not overwrite:
+CONNECSO-ui-ipv6-test.apk
+
+At the end provide a concise implementation report containing:
+
+1. Phase 1 files changed
+2. Phase 1 APK exact path
+3. Phase 2 files changed
+4. Phase 2 APK exact path
+5. tests/checks executed
+6. any requirement that could not be fully completed
+7. any existing broken/dead implementation discovered
+8. any behavior intentionally preserved
+9. no claim of success for features that were not actually verified
+
+======================================================================
+NON-NEGOTIABLE RULES
+======================================================================
+
+1. Do not disable broken features to make the build pass.
+2. Do not remove working features unnecessarily.
+3. Do not bypass VPN for Google/YouTube/Yahoo as a "fix".
+4. Do not add a third visible System Theme option.
+5. Do not refresh subscription every time Connect is pressed.
+6. Do not erase Last Good/history on subscription refresh.
+7. Do not continuously ping DEAD nodes.
+8. Do not mark slow-but-responsive nodes as DEAD.
+9. Do not use the old local proxy-connect latency as the primary Ping.
+10. Do not globally blackhole UDP/443.
+11. Do not enable Mux by default.
+12. Do not wait for all low-priority tiers when a strong Tier 1 candidate is available.
+13. Do not create an always-running CPU analysis loop.
+14. Do not lose subscription or Split Tunneling data after process restart.
+15. Do not stop between Phase 1 and Phase 2 waiting for user approval.
+16. Build an APK after Phase 1.
+17. Then complete Phase 2 and build another APK.
