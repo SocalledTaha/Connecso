@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import '../models/vpn_node.dart';
 import 'country_lookup.dart';
 
@@ -34,6 +36,19 @@ class LocationResolver {
     for (final location in cities) {
       if (location.countryCode == code) return location;
     }
+    for (final country in offlineCountries) {
+      if (country.code.toUpperCase() == code) {
+        return DestinationLocation(
+          country: country.displayName,
+          countryCode: code,
+          city: '',
+          latitude: country.latitude,
+          longitude: country.longitude,
+          source: LocationSource.database,
+          confidence: .65,
+        );
+      }
+    }
     return null;
   }
 
@@ -47,7 +62,12 @@ class LocationResolver {
   }
 
   static String flagForCode(String? value) {
-    final code = canonicalCountryCode(value);
+    final raw = value?.trim().toUpperCase() ?? '';
+    final code = canonicalCountryCode(raw).isNotEmpty
+        ? canonicalCountryCode(raw)
+        : RegExp(r'^[A-Z]{2}$').hasMatch(raw)
+        ? raw
+        : '';
     if (code.length != 2) return '🌐';
     return String.fromCharCodes(
       code.codeUnits.map((unit) => 0x1F1E6 + unit - 65),
@@ -165,9 +185,44 @@ class LocationResolver {
     final countryReference =
         _countryForCode(rawCountryCode) ??
         (rawCountry.isEmpty ? null : _matchCountry(rawCountry));
+    var resolvedCountryReference = countryReference;
+    if (node.latitude != null && node.longitude != null) {
+      final coordinateCountry = _nearestCountry(
+        node.latitude!,
+        node.longitude!,
+      );
+      final namedDistance = countryReference == null
+          ? double.infinity
+          : _distanceKm(
+              node.latitude!,
+              node.longitude!,
+              countryReference.latitude,
+              countryReference.longitude,
+            );
+      final coordinateDistance = coordinateCountry == null
+          ? double.infinity
+          : _distanceKm(
+              node.latitude!,
+              node.longitude!,
+              coordinateCountry.latitude,
+              coordinateCountry.longitude,
+            );
+      // Provider records occasionally combine an unrelated country label
+      // with precise exit coordinates. Resolve clear contradictions from the
+      // coordinates, while keeping country metadata for ordinary proximity
+      // differences (large countries and border regions).
+      if (coordinateCountry != null &&
+          (countryReference == null ||
+              coordinateCountry.code != countryReference.code) &&
+          (countryReference == null ||
+              namedDistance - coordinateDistance > 1000)) {
+        resolvedCountryReference = coordinateCountry;
+      }
+    }
     final countryCode =
-        countryReference?.code.toUpperCase() ?? rawCountryCode.toUpperCase();
-    final country = countryReference?.displayName ?? rawCountry;
+        resolvedCountryReference?.code.toUpperCase() ??
+        rawCountryCode.toUpperCase();
+    final country = resolvedCountryReference?.displayName ?? rawCountry;
 
     // Explicit subscription coordinates take priority and are not rewritten.
     if (node.latitude != null && node.longitude != null) {
@@ -251,6 +306,45 @@ class LocationResolver {
       confidence: .55,
     );
   }
+
+  static CountryReference? _nearestCountry(double latitude, double longitude) {
+    CountryReference? nearest;
+    var nearestDistance = double.infinity;
+    for (final country in offlineCountries) {
+      if (country.code.isEmpty) continue;
+      final distance = _distanceKm(
+        latitude,
+        longitude,
+        country.latitude,
+        country.longitude,
+      );
+      if (distance < nearestDistance) {
+        nearest = country;
+        nearestDistance = distance;
+      }
+    }
+    return nearest;
+  }
+
+  static double _distanceKm(
+    double latitude1,
+    double longitude1,
+    double latitude2,
+    double longitude2,
+  ) {
+    const earthRadiusKm = 6371.0;
+    final dLat = _radians(latitude2 - latitude1);
+    final dLon = _radians(longitude2 - longitude1);
+    final a =
+        (math.sin(dLat / 2) * math.sin(dLat / 2)) +
+        math.cos(_radians(latitude1)) *
+            math.cos(_radians(latitude2)) *
+            math.sin(dLon / 2) *
+            math.sin(dLon / 2);
+    return earthRadiusKm * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+  }
+
+  static double _radians(double degrees) => degrees * math.pi / 180;
 
   static CountryReference? _countryForCode(String code) {
     if (code.isEmpty) return null;

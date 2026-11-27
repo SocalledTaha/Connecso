@@ -145,143 +145,125 @@ class ConnectionStatusPanel extends StatelessWidget {
           onPressed: onPressed,
         ),
         const SizedBox(height: 1),
-        SizedBox(
-          height: 74,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              AnimatedSwitcher(
-                duration: _connectionTextDuration(context),
-                transitionBuilder: (child, animation) => SlideTransition(
-                  position:
-                      Tween<Offset>(
-                        begin: const Offset(0, .22),
-                        end: Offset.zero,
-                      ).animate(
-                        CurvedAnimation(
-                          parent: animation,
-                          curve: Curves.easeOutCubic,
-                        ),
+        Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            AnimatedSwitcher(
+              duration: _connectionTextDuration(context),
+              transitionBuilder: (child, animation) => SlideTransition(
+                position:
+                    Tween<Offset>(
+                      begin: const Offset(0, .22),
+                      end: Offset.zero,
+                    ).animate(
+                      CurvedAnimation(
+                        parent: animation,
+                        curve: Curves.easeOutCubic,
                       ),
-                  child: FadeTransition(opacity: animation, child: child),
-                ),
-                child: Text(
-                  connectionLabel,
-                  key: ValueKey('$phase-$connectionLabel'),
-                  textAlign: TextAlign.center,
-                  style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                    fontSize: 23,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: .1,
-                    color: phase == ConnectionPhase.failed
-                        ? Theme.of(context).colorScheme.error
-                        : null,
-                  ),
+                    ),
+                child: FadeTransition(opacity: animation, child: child),
+              ),
+              // Avoid painting the outgoing state under the incoming one.
+              // The stacked default is noticeable when labels have the same
+              // baseline (for example Connecting -> Disconnected).
+              layoutBuilder: (currentChild, previousChildren) =>
+                  currentChild ?? const SizedBox.shrink(),
+              child: Text(
+                connectionLabel,
+                key: ValueKey('$phase-$connectionLabel'),
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                  fontSize: 23,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: .1,
+                  color: phase == ConnectionPhase.failed
+                      ? Theme.of(context).colorScheme.error
+                      : null,
                 ),
               ),
-              if (phase == ConnectionPhase.connected && health != null)
-                AnimatedSwitcher(
-                  duration: _connectionTextDuration(context),
-                  transitionBuilder: (child, animation) =>
-                      FadeTransition(opacity: animation, child: child),
-                  // Do not keep the previous ping visible while the fresh
-                  // destination measurement fades in.
-                  layoutBuilder: (currentChild, previousChildren) =>
-                      currentChild ?? const SizedBox.shrink(),
-                  child: Padding(
-                    key: ValueKey('health-$health'),
-                    padding: const EdgeInsets.only(top: 2),
-                    child: onRefreshPing == null
-                        ? _healthText(context)
-                        : Tooltip(
-                            message: refreshPingLabel,
-                            child: Semantics(
-                              button: true,
-                              label: '$health. $refreshPingLabel',
-                              enabled: !refreshingPing,
-                              child: Material(
-                                color: Colors.transparent,
-                                child: InkWell(
-                                  key: const ValueKey(
-                                    'refresh-connection-ping',
+            ),
+            if (phase == ConnectionPhase.connected && health != null)
+              AnimatedSwitcher(
+                duration: _connectionTextDuration(context),
+                transitionBuilder: (child, animation) =>
+                    FadeTransition(opacity: animation, child: child),
+                // Do not keep the previous ping visible while the fresh
+                // destination measurement fades in.
+                layoutBuilder: (currentChild, previousChildren) =>
+                    currentChild ?? const SizedBox.shrink(),
+                child: Padding(
+                  key: ValueKey('health-$health'),
+                  padding: const EdgeInsets.only(top: 2),
+                  child: onRefreshPing == null
+                      ? _healthText(context)
+                      : Tooltip(
+                          message: refreshPingLabel,
+                          child: Semantics(
+                            button: true,
+                            label: '$health. $refreshPingLabel',
+                            enabled: !refreshingPing,
+                            child: Material(
+                              color: Colors.transparent,
+                              child: InkWell(
+                                key: const ValueKey('refresh-connection-ping'),
+                                borderRadius: BorderRadius.circular(18),
+                                onTap: refreshingPing ? null : onRefreshPing,
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                    vertical: 4,
                                   ),
-                                  borderRadius: BorderRadius.circular(18),
-                                  onTap: refreshingPing ? null : onRefreshPing,
-                                  child: Padding(
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 10,
-                                      vertical: 4,
-                                    ),
-                                    child: Row(
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        _healthText(context),
-                                        const SizedBox(width: 6),
-                                        AnimatedSwitcher(
-                                          duration: _connectionTextDuration(
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      _healthText(context),
+                                      const SizedBox(width: 6),
+                                      TickerMode(
+                                        enabled: true,
+                                        child: _RotatingPingRefreshIcon(
+                                          refreshing: refreshingPing,
+                                          idleColor: Theme.of(
                                             context,
-                                          ),
-                                          child: refreshingPing
-                                              ? SizedBox(
-                                                  key: const ValueKey(
-                                                    'ping-loading',
-                                                  ),
-                                                  width: 14,
-                                                  height: 14,
-                                                  child:
-                                                      CircularProgressIndicator(
-                                                        strokeWidth: 2,
-                                                        color: Theme.of(
-                                                          context,
-                                                        ).colorScheme.primary,
-                                                      ),
-                                                )
-                                              : Icon(
-                                                  Icons.refresh_rounded,
-                                                  key: const ValueKey(
-                                                    'ping-refresh-icon',
-                                                  ),
-                                                  size: 16,
-                                                  color: Theme.of(context)
-                                                      .colorScheme
-                                                      .onSurfaceVariant,
-                                                ),
+                                          ).colorScheme.onSurfaceVariant,
+                                          activeColor: Theme.of(
+                                            context,
+                                          ).colorScheme.primary,
                                         ),
-                                      ],
-                                    ),
+                                      ),
+                                    ],
                                   ),
                                 ),
                               ),
                             ),
                           ),
+                        ),
+                ),
+              ),
+            if (phase == ConnectionPhase.disconnected && onPressed != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Text(
+                  actionLabel,
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    fontSize: 15,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
                   ),
                 ),
-              if (phase == ConnectionPhase.disconnected && onPressed != null)
-                Padding(
-                  padding: const EdgeInsets.only(top: 2),
-                  child: Text(
-                    actionLabel,
-                    textAlign: TextAlign.center,
-                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      fontSize: 15,
-                      color: Theme.of(context).colorScheme.onSurfaceVariant,
-                    ),
+              ),
+            if (phase == ConnectionPhase.failed && failure != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Text(
+                  failure!,
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    fontSize: 15,
+                    color: Theme.of(context).colorScheme.error,
                   ),
                 ),
-              if (phase == ConnectionPhase.failed && failure != null)
-                Padding(
-                  padding: const EdgeInsets.only(top: 2),
-                  child: Text(
-                    failure!,
-                    textAlign: TextAlign.center,
-                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      fontSize: 15,
-                      color: Theme.of(context).colorScheme.error,
-                    ),
-                  ),
-                ),
-            ],
-          ),
+              ),
+          ],
         ),
       ],
     ),
@@ -295,6 +277,66 @@ class ConnectionStatusPanel extends StatelessWidget {
       fontSize: 16,
       fontWeight: FontWeight.w600,
       letterSpacing: .1,
+    ),
+  );
+}
+
+class _RotatingPingRefreshIcon extends StatefulWidget {
+  const _RotatingPingRefreshIcon({
+    required this.refreshing,
+    required this.idleColor,
+    required this.activeColor,
+  });
+
+  final bool refreshing;
+  final Color idleColor;
+  final Color activeColor;
+
+  @override
+  State<_RotatingPingRefreshIcon> createState() =>
+      _RotatingPingRefreshIconState();
+}
+
+class _RotatingPingRefreshIconState extends State<_RotatingPingRefreshIcon>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _rotation = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 800),
+    animationBehavior: AnimationBehavior.preserve,
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.refreshing) _rotation.repeat();
+  }
+
+  @override
+  void didUpdateWidget(covariant _RotatingPingRefreshIcon oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.refreshing == oldWidget.refreshing) return;
+    if (widget.refreshing) {
+      _rotation.repeat();
+    } else {
+      _rotation
+        ..stop()
+        ..value = 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _rotation.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => RotationTransition(
+    turns: _rotation,
+    child: Icon(
+      Icons.refresh_rounded,
+      size: 16,
+      color: widget.refreshing ? widget.activeColor : widget.idleColor,
     ),
   );
 }

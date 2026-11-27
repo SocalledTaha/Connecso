@@ -50,10 +50,20 @@ class _ConnectionMethodSelectorState extends State<ConnectionMethodSelector> {
 
   Future<void> _close(ConnectionMethod? method, {bool chosen = false}) async {
     if (_closing) return;
+    final noMotion = MediaQuery.disableAnimationsOf(context);
     setState(() {
       _closing = true;
       if (chosen) _selected = method;
     });
+    if (noMotion) {
+      if (!mounted) return;
+      if (chosen) {
+        widget.onSelected(method);
+      } else {
+        widget.onDismissed();
+      }
+      return;
+    }
     if (chosen) {
       await Future<void>.delayed(const Duration(milliseconds: 140));
     }
@@ -80,6 +90,7 @@ class _ConnectionMethodSelectorState extends State<ConnectionMethodSelector> {
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
+    final noMotion = MediaQuery.disableAnimationsOf(context);
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, result) {
@@ -92,22 +103,31 @@ class _ConnectionMethodSelectorState extends State<ConnectionMethodSelector> {
             Padding(
               padding: const EdgeInsets.only(bottom: 8),
               child: AnimatedSlide(
-                offset: _visible.contains(i)
+                offset: noMotion || _visible.contains(i)
                     ? Offset.zero
                     : const Offset(0, .08),
-                duration: const Duration(milliseconds: 220),
+                duration: noMotion
+                    ? Duration.zero
+                    : const Duration(milliseconds: 220),
                 curve: Curves.easeOutCubic,
                 child: AnimatedOpacity(
-                  opacity: _visible.contains(i) ? 1 : 0,
-                  duration: const Duration(milliseconds: 220),
+                  opacity: noMotion || _visible.contains(i) ? 1 : 0,
+                  duration: noMotion
+                      ? Duration.zero
+                      : const Duration(milliseconds: 220),
                   child: AnimatedScale(
                     scale: _closing && _selected == _options[i] ? 1.025 : 1,
-                    duration: const Duration(milliseconds: 140),
+                    duration: noMotion
+                        ? Duration.zero
+                        : const Duration(milliseconds: 140),
                     child: IgnorePointer(
-                      ignoring: _closing || !_visible.contains(i),
+                      ignoring:
+                          _closing || (!noMotion && !_visible.contains(i)),
                       child: Material(
                         color: _selected == _options[i]
                             ? colors.primaryContainer
+                            : noMotion
+                            ? colors.surfaceContainerHighest
                             : colors.surfaceContainerHighest.withValues(
                                 alpha: .94,
                               ),

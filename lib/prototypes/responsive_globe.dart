@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -96,6 +97,7 @@ class ResponsiveGlobe extends StatefulWidget {
     this.sourceTarget = _iranFocus,
     this.destinationTarget,
     this.lightMode = false,
+    this.performanceMode = false,
     super.key,
   });
   final double globeScale, globeCenterYFraction;
@@ -103,6 +105,7 @@ class ResponsiveGlobe extends StatefulWidget {
   final GlobeTarget sourceTarget;
   final GlobeTarget? destinationTarget;
   final bool lightMode;
+  final bool performanceMode;
   @override
   State<ResponsiveGlobe> createState() => _GlobeState();
 }
@@ -131,20 +134,32 @@ class _GlobeState extends State<ResponsiveGlobe> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
-    active = widget.sourceTarget;
-    pendingActive = widget.sourceTarget;
-    rotation = -widget.sourceTarget.lon;
+    // Performance Mode removes the map subtree from rendering. When it is
+    // shown again, start directly at the selected destination instead of
+    // briefly resetting to the source and animating across the globe.
+    final initialTarget = widget.destinationTarget ?? widget.sourceTarget;
+    active = initialTarget;
+    pendingActive = initialTarget;
+    rotation = -initialTarget.lon;
     fromR = rotation;
     toR = rotation;
+    zoom = widget.destinationTarget == null ? 1.65 : 1.7;
+    fromZ = zoom;
+    toZ = zoom;
     _load();
     anim.addListener(_onAnimationTick);
     pulse.addListener(_onAnimationTick);
+    if (widget.destinationTarget != null && !widget.performanceMode) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && !widget.performanceMode) pulse.repeat();
+      });
+    }
     anim.addStatusListener((s) {
       if (s == AnimationStatus.completed) {
         rotation = toR;
         zoom = toZ;
         active = pendingActive;
-        pulse.repeat();
+        if (!widget.performanceMode) pulse.repeat();
         setState(() {});
       }
     });
@@ -153,6 +168,15 @@ class _GlobeState extends State<ResponsiveGlobe> with TickerProviderStateMixin {
   @override
   void didUpdateWidget(covariant ResponsiveGlobe oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.performanceMode != widget.performanceMode) {
+      if (widget.performanceMode) {
+        pulse
+          ..stop()
+          ..value = 0;
+      } else if (!anim.isAnimating && active != null) {
+        pulse.repeat();
+      }
+    }
     if (oldWidget.lightMode != widget.lightMode) {
       lightMode = widget.lightMode;
     }
@@ -229,6 +253,23 @@ class _GlobeState extends State<ResponsiveGlobe> with TickerProviderStateMixin {
   }
 
   void _selectTarget(GlobeTarget t) {
+    if (widget.performanceMode || MediaQuery.disableAnimationsOf(context)) {
+      pulse
+        ..stop()
+        ..value = 0;
+      anim.stop();
+      setState(() {
+        active = t;
+        pendingActive = t;
+        rotation = -t.lon;
+        fromR = rotation;
+        toR = rotation;
+        zoom = 1.7;
+        fromZ = zoom;
+        toZ = zoom;
+      });
+      return;
+    }
     setState(() {
       pendingActive = t;
       fromR = rotation;
@@ -302,7 +343,7 @@ class _GlobeState extends State<ResponsiveGlobe> with TickerProviderStateMixin {
               active,
               pendingActive,
               focusLat,
-              pulse.value,
+              widget.performanceMode ? 0 : pulse.value,
               lightMode,
             ),
           ),
@@ -450,9 +491,7 @@ class _Painter extends CustomPainter {
       center,
       rad,
       Paint()
-        ..color = lightMode
-            ? const Color(0xFF86CFE8)
-            : const Color(0xFF05202C),
+        ..color = lightMode ? const Color(0xFF86CFE8) : const Color(0xFF05202C),
     );
     if (_debugDots) {
       const ambient = <Offset>[
@@ -628,10 +667,11 @@ class _Painter extends CustomPainter {
           c.drawPath(
             p,
             Paint()
-              ..color = (lightMode
-                      ? const Color(0xFF129B72)
-                      : const Color(0xFF55E6AD))
-                  .withValues(alpha: lightMode ? .90 : .72)
+              ..color =
+                  (lightMode
+                          ? const Color(0xFF129B72)
+                          : const Color(0xFF55E6AD))
+                      .withValues(alpha: lightMode ? .90 : .72)
               ..style = PaintingStyle.stroke
               ..strokeWidth = 1.35,
           );
@@ -646,7 +686,8 @@ class _Painter extends CustomPainter {
       final labelRings = <String, _GeoRing>{};
       for (final candidate in rs) {
         final current = labelRings[candidate.country];
-        if (current == null || _ringArea(candidate.points) > _ringArea(current.points)) {
+        if (current == null ||
+            _ringArea(candidate.points) > _ringArea(current.points)) {
           labelRings[candidate.country] = candidate;
         }
       }

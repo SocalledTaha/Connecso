@@ -8,6 +8,8 @@ import android.os.Build
 class ContunTunnelEngine : TunnelEngine {
     override val name: String = "Contun"
     @Volatile private var started = false
+    @Volatile private var baselineRxBytes = 0L
+    @Volatile private var baselineTxBytes = 0L
 
     override fun start(
         service: VpnService,
@@ -30,6 +32,8 @@ class ContunTunnelEngine : TunnelEngine {
         }.getOrDefault(-1)
         started = result == 0
         if (started) {
+            baselineRxBytes = nativeCounter(1)
+            baselineTxBytes = nativeCounter(3)
             Log.i(TAG, "event=contun.started version=${runCatching { ContunNative.nativeVersion() }.getOrDefault("unknown")}")
         } else {
             Log.w(TAG, "event=contun.start_rejected code=$result")
@@ -43,6 +47,8 @@ class ContunTunnelEngine : TunnelEngine {
             runCatching { ContunNative.nativeStop() }
                 .onFailure { Log.w(TAG, "event=contun.stop_failed failureType=${it.javaClass.simpleName}") }
             started = false
+            baselineRxBytes = 0L
+            baselineTxBytes = 0L
             Log.i(TAG, "event=contun.stopped")
         }
     }
@@ -59,17 +65,20 @@ class ContunTunnelEngine : TunnelEngine {
 
     override fun stats(): TunnelEngineStats {
         if (!started) return TunnelEngineStats()
-        fun counter(index: Int): Long = runCatching { ContunNative.nativeCounter(index) }
-            .getOrDefault(0L)
-            .coerceAtLeast(0L)
         return TunnelEngineStats(
-            rxPackets = counter(0),
-            txPackets = counter(2),
-            tcpOpened = counter(13),
-            tcpFailed = counter(17),
-            udpSessions = counter(19),
+            rxPackets = nativeCounter(0),
+            txPackets = nativeCounter(2),
+            rxBytes = (nativeCounter(1) - baselineRxBytes).coerceAtLeast(0),
+            txBytes = (nativeCounter(3) - baselineTxBytes).coerceAtLeast(0),
+            tcpOpened = nativeCounter(13),
+            tcpFailed = nativeCounter(17),
+            udpSessions = nativeCounter(19),
         )
     }
+
+    private fun nativeCounter(index: Int): Long = runCatching { ContunNative.nativeCounter(index) }
+        .getOrDefault(0L)
+        .coerceAtLeast(0L)
 
     private fun buildConfig(config: TunnelEngineConfig, tunFd: Int): String {
         val addresses = buildList {

@@ -141,7 +141,7 @@ const offlineCountries = <CountryReference>[
   CountryReference(name: 'Jordan', code: 'JO', latitude: 30.805000, longitude: 36.376000),
   CountryReference(name: 'Kazakhstan', code: 'KZ', latitude: 49.054100, longitude: 68.685500),
   CountryReference(name: 'Kenya', code: 'KE', latitude: 0.549000, longitude: 37.907600),
-  CountryReference(name: 'Kosovo', code: '', latitude: 42.593600, longitude: 20.860700),
+  CountryReference(name: 'Kosovo', code: 'XK', latitude: 42.593600, longitude: 20.860700),
   CountryReference(name: 'Kuwait', code: 'KW', latitude: 29.413600, longitude: 47.314000),
   CountryReference(name: 'Kyrgyzstan', code: 'KG', latitude: 41.668500, longitude: 74.532600),
   CountryReference(name: 'Laos', code: 'LA', latitude: 19.431800, longitude: 102.533900),

@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/connecso_widget_background"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:padding="16dp">
+    <ImageView
+        android:layout_width="42dp"
+        android:layout_height="42dp"
+        android:contentDescription="Connecso"
+        android:src="@mipmap/ic_launcher" />
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:orientation="vertical"
+        android:paddingStart="12dp">
+        <TextView
+            android:id="@+id/widget_state"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Ready to connect"
+            android:textColor="#10212C"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+        <TextView
+            android:id="@+id/widget_detail"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Connecso Mobile Client"
+            android:textColor="#526673"
+            android:textSize="13sp" />
+        <TextView
+            android:id="@+id/widget_usage"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingTop="3dp"
+            android:text="Usage unavailable"
+            android:textColor="#218DB8"
+            android:textSize="12sp" />
+    </LinearLayout>
+    <ImageView
+        android:id="@+id/widget_action"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:background="@drawable/connecso_widget_action"
+        android:paddingHorizontal="14dp"
+        android:paddingVertical="9dp" android:scaleType="fitCenter" android:padding="11dp" android:src="@drawable/ic_widget_power" />
+</LinearLayout>

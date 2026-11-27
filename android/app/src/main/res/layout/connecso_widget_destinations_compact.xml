@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/connecso_widget_background"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:padding="7dp">
+
+    <ImageView
+        android:id="@+id/widget_logo"
+        android:layout_width="25dp"
+        android:layout_height="31dp"
+        android:contentDescription="Connecso"
+        android:scaleType="fitCenter"
+        android:src="@drawable/connecso_widget_logo_light" />
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:gravity="center_vertical"
+        android:orientation="vertical"
+        android:paddingStart="5dp"
+        android:paddingEnd="4dp">
+        <TextView
+            android:id="@+id/widget_state"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:text="Connected"
+            android:textColor="@color/widget_primary_text"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+        <TextView
+            android:id="@+id/widget_detail"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:text="Connecso"
+            android:textColor="@color/widget_secondary_text"
+            android:textSize="9sp" />
+        <TextView
+            android:id="@+id/widget_usage"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:paddingTop="2dp"
+            android:text="Used — / —"
+            android:textColor="@color/widget_accent"
+            android:textSize="9sp"
+            android:textStyle="bold" />
+        <ProgressBar
+            android:id="@+id/widget_quota"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="3dp"
+            android:layout_marginTop="3dp"
+            android:max="100"
+            android:progress="0"
+            android:progressTint="@color/widget_accent"
+            android:progressBackgroundTint="@color/widget_progress_track" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/widget_destination_panel"
+        android:layout_width="100dp"
+        android:layout_height="match_parent"
+        android:gravity="center_vertical"
+        android:orientation="vertical"
+        android:paddingStart="3dp"
+        android:paddingEnd="3dp">
+        <TextView
+            android:id="@+id/widget_destinations_label"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:text="Favorites"
+            android:textColor="@color/widget_secondary_text"
+            android:textSize="10sp"
+            android:textStyle="bold" />
+        <ListView
+            android:id="@+id/widget_destinations"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:divider="@android:color/transparent"
+            android:dividerHeight="3dp"
+            android:scrollbars="none" />
+        <TextView
+            android:id="@+id/widget_destinations_empty"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:maxLines="3"
+            android:text="No destinations available"
+            android:textColor="@color/widget_secondary_text"
+            android:textSize="9sp" />
+    </LinearLayout>
+
+    <ImageView
+        android:id="@+id/widget_action"
+        android:layout_width="36dp"
+        android:layout_height="36dp"
+        android:layout_marginStart="3dp"
+        android:background="@drawable/connecso_widget_power_idle"
+        android:contentDescription="Connect"
+        android:padding="9dp"
+        android:scaleType="fitCenter"
+        android:src="@drawable/ic_widget_power" />
+</LinearLayout>

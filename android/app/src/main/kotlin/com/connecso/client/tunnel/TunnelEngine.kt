@@ -16,6 +16,8 @@ data class TunnelEngineConfig(
 data class TunnelEngineStats(
     val rxPackets: Long = 0,
     val txPackets: Long = 0,
+    val rxBytes: Long? = null,
+    val txBytes: Long? = null,
     val tcpOpened: Long = 0,
     val tcpFailed: Long = 0,
     val udpSessions: Long = 0,

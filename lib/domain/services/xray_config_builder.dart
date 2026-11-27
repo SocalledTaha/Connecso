@@ -5,7 +5,9 @@ import '../models/vpn_node.dart';
 /// Produces the Xray configuration for one normalized subscription node.
 /// Android HEV feeds the VpnService TUN packets to Xray's local SOCKS inbound.
 class XrayConfigBuilder {
-  const XrayConfigBuilder();
+  const XrayConfigBuilder({this.fakeDnsEnabled = false});
+
+  final bool fakeDnsEnabled;
 
   static const socksInboundTag = 'connecso-socks';
   static const socksPort = 10808;
@@ -13,14 +15,20 @@ class XrayConfigBuilder {
   static const dnsTag = 'connecso-dns';
   static const blockTag = 'connecso-block';
   static const metricsPort = 49227;
-
   Map<String, Object?> build(VpnNode node) {
     final outbound = _outbound(node);
     return {
       'log': {'loglevel': 'warning'},
       'dns': {
-        'servers': ['1.1.1.1', '8.8.8.8'],
+        'servers': fakeDnsEnabled
+            ? ['fakedns', 'https://1.1.1.1/dns-query']
+            : ['1.1.1.1', '8.8.8.8'],
       },
+      if (fakeDnsEnabled)
+        'fakedns': [
+          {'ipPool': '198.18.0.0/16', 'poolSize': 65535},
+          {'ipPool': '2001:2::/48', 'poolSize': 65535},
+        ],
       'stats': <String, Object?>{},
       'policy': {
         'system': {'statsInboundUplink': true, 'statsInboundDownlink': true},
@@ -35,8 +43,13 @@ class XrayConfigBuilder {
           'settings': {'auth': 'noauth', 'udp': true, 'userLevel': 0},
           'sniffing': {
             'enabled': true,
-            'routeOnly': true,
-            'destOverride': ['http', 'tls', 'quic'],
+            'routeOnly': !fakeDnsEnabled,
+            'destOverride': [
+              'http',
+              'tls',
+              'quic',
+              if (fakeDnsEnabled) 'fakedns',
+            ],
           },
         },
       ],
@@ -240,9 +253,7 @@ class XrayConfigBuilder {
           'path': credentials['path'] ?? '/',
           if (_nonEmpty(credentials['hostHeader']))
             'host': credentials['hostHeader'],
-          'headers': {
-            'User-Agent': credentials['userAgent'] ?? 'chrome',
-          },
+          'headers': {'User-Agent': credentials['userAgent'] ?? 'chrome'},
         };
       case 'grpc':
         stream['grpcSettings'] = {
@@ -289,12 +300,6 @@ class XrayConfigBuilder {
         if (credentials['allowInsecure'] == 'true') 'allowInsecure': true,
         if (_nonEmpty(credentials['pinSHA256']))
           'pinnedPeerCertSha256': [credentials['pinSHA256']],
-        if (_nonEmpty(credentials['echConfigList']))
-          'echConfigList': credentials['echConfigList'],
-        if (_nonEmpty(credentials['echForceQuery']))
-          'echForceQuery': _structuredBooleanOrMode(
-            credentials['echForceQuery']!,
-          ),
         // Match the common TLS/WS server profile when the subscription does
         // not explicitly provide a uTLS fingerprint.
         'fingerprint': node.fingerprint ?? 'chrome',

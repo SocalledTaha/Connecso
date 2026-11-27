@@ -5,6 +5,7 @@ import 'package:workmanager/workmanager.dart';
 import '../../data/repositories/saved_subscriptions.dart';
 import '../../data/repositories/subscription_cache.dart';
 import '../../data/repositories/subscription_repository.dart';
+import '../../data/repositories/subscription_request_identity.dart';
 
 const _refreshTask = 'connecso.subscription.refresh';
 const _refreshWorkName = 'connecso.periodic.subscription.refresh';
@@ -18,6 +19,7 @@ void connecsoBackgroundDispatcher() {
     final profiles = SavedSubscriptionsStore(storage);
     final repository = SubscriptionRepository(
       cache: SecureSubscriptionCache(storage),
+      requestHeadersProvider: SubscriptionRequestIdentity(storage).headers,
     );
     try {
       final saved = await profiles.read();

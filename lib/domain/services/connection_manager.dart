@@ -6,6 +6,7 @@ import '../models/vpn_node.dart';
 import 'connection_state_machine.dart';
 import 'connect_trace.dart';
 import 'core_manager.dart';
+import 'endpoint_resolver.dart';
 import 'location_resolver.dart';
 import 'split_tunnel_policy.dart';
 import 'structured_logger.dart';
@@ -26,8 +27,9 @@ class ConnectionCancelled implements Exception {
   const ConnectionCancelled();
 }
 
-/// Starts one endpoint that has already been selected by [EndpointResolver].
-/// This layer deliberately has no country, destination mode, tier or scoring logic.
+/// Starts ranked endpoints produced by [EndpointResolver], advancing through
+/// reachable candidates and priority tiers only when an actual tunnel attempt
+/// fails for an endpoint-specific, retryable reason.
 class ConnectionManager {
   ConnectionManager({
     required TunnelAdapter tunnel,
@@ -131,13 +133,21 @@ class ConnectionManager {
     _transitionTo(ConnectionPhase.preparing);
     final stopwatch = Stopwatch()..start();
     try {
+      _trace('core_initialize_start');
       await _cores.initialize();
+      _trace('core_initialize_complete');
       _throwIfConnectCancelled();
       final core = _cores.choose(node);
+      _trace(
+        'core_selected',
+        'available=${core != null} protocol=${node.protocol.name}',
+      );
       if (core == null)
         throw const CoreException('No compatible VPN core is installed.');
       _onNodeSelected?.call(node);
+      _trace('vpn_permission_request_start');
       await _tunnel.requestPermission();
+      _trace('vpn_permission_granted');
       _throwIfConnectCancelled();
       _transitionTo(ConnectionPhase.connecting);
       _trace(
@@ -145,10 +155,13 @@ class ConnectionManager {
         'node=${node.id} protocol=${node.protocol.name} transport=${node.transport}',
       );
       await _tunnel.start(core, node, splitTunnelPolicy: splitTunnelPolicy);
+      _trace('tunnel_start_completed');
       _throwIfConnectCancelled();
       _transitionTo(ConnectionPhase.verifying);
       _trace('dataplane_verification_start');
-      if (!await _tunnel.verifyUsableConnectivity()) {
+      final verified = await _tunnel.verifyUsableConnectivity();
+      _trace('dataplane_verification_complete', 'verified=$verified');
+      if (!verified) {
         throw const CoreException(
           'Connection could not be verified through the VPN dataplane.',
           retryable: true,
@@ -174,12 +187,80 @@ class ConnectionManager {
         stopwatch.elapsed,
       );
     } catch (error) {
+      final safeFailure = error is CoreException
+          ? error.message
+          : error.runtimeType.toString();
+      _trace(
+        'connection_attempt_threw',
+        'type=${error.runtimeType} detail=${safeFailure.replaceAll(RegExp(r'\s+'), ' ')}',
+      );
       await _handleConnectionFailure(node, stopwatch.elapsed, error);
       if (error is ConnectionCancelled || _connectCancelled)
         throw const ConnectionCancelled();
       rethrow;
     } finally {
       _connectCancelled = false;
+    }
+  }
+
+  Future<VpnNode> connectWithFailover({
+    required Future<EndpointResolution> Function(Set<String> excludedNodeIds)
+    resolve,
+    required SplitTunnelPolicy splitTunnelPolicy,
+    bool reconnect = false,
+  }) async {
+    final excluded = <String>{};
+    Object? lastConnectionError;
+    var reconnectCurrent = reconnect;
+    var attemptNumber = 0;
+
+    while (true) {
+      late final EndpointResolution resolution;
+      try {
+        resolution = await resolve(Set.unmodifiable(excluded));
+      } catch (_) {
+        if (lastConnectionError != null) throw lastConnectionError;
+        rethrow;
+      }
+      excluded.addAll(resolution.checkedNodeIds);
+      if (resolution.endpoints.isEmpty) {
+        if (lastConnectionError != null) throw lastConnectionError;
+        throw const CoreException(
+          'No reachable endpoint matched the selection.',
+        );
+      }
+
+      for (final endpoint in resolution.endpoints) {
+        attemptNumber++;
+        try {
+          return reconnectCurrent
+              ? await this.reconnect(
+                  endpoint,
+                  splitTunnelPolicy: splitTunnelPolicy,
+                )
+              : await connect(endpoint, splitTunnelPolicy: splitTunnelPolicy);
+        } catch (error) {
+          if (error is ConnectionCancelled) rethrow;
+          if (error is! CoreException || !error.retryable) rethrow;
+          lastConnectionError = error;
+          reconnectCurrent = false;
+          final nextExists =
+              attemptNumber < resolution.endpoints.length ||
+              resolution.checkedNodeIds.isNotEmpty;
+          ConnectTrace.emit(
+            'connection_candidate_failed node=${endpoint.node.id} '
+            'retryable=true attempt=$attemptNumber nextCandidate=$nextExists',
+          );
+          developer.log(
+            'connection_candidate_failed node=${endpoint.node.id} '
+            'retryable=true nextCandidate=$nextExists',
+            name: 'CONNECSO/Resolver',
+          );
+        }
+      }
+      // The next resolution excludes every node examined in this tier. It
+      // therefore advances to the next tier only after this tier's viable
+      // candidates have all failed during tunnel start or verification.
     }
   }
 
@@ -209,9 +290,12 @@ class ConnectionManager {
     try {
       await _recordNodeFailure?.call(node, duration);
     } catch (_) {}
+    Object? cleanupError;
     try {
       await _tunnel.stop();
-    } catch (_) {}
+    } catch (failure) {
+      cleanupError = failure;
+    }
     _logger.record(
       category: LogCategory.vpn,
       severity: LogSeverity.warning,
@@ -226,6 +310,17 @@ class ConnectionManager {
       }
     } else if (machine.phase != ConnectionPhase.failed) {
       _transitionTo(ConnectionPhase.failed);
+    }
+    if (cleanupError != null) {
+      _logger.record(
+        category: LogCategory.vpn,
+        severity: LogSeverity.error,
+        event: 'connection.failed_attempt_cleanup_failed',
+        fields: {'failureType': cleanupError.runtimeType.toString()},
+      );
+      throw const CoreException(
+        'VPN cleanup failed after a connection attempt.',
+      );
     }
   }
 

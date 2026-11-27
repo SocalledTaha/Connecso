@@ -57,6 +57,10 @@ class HevTunnelEngine(private val configDir: File) : TunnelEngine {
         return TunnelEngineStats(
             rxPackets = (current.rxPackets - baseline.rxPackets).coerceAtLeast(0),
             txPackets = (current.txPackets - baseline.txPackets).coerceAtLeast(0),
+            rxBytes = ((current.rxBytes ?: 0) - (baseline.rxBytes ?: 0))
+                .coerceAtLeast(0),
+            txBytes = ((current.txBytes ?: 0) - (baseline.txBytes ?: 0))
+                .coerceAtLeast(0),
         )
     }
 
@@ -64,8 +68,10 @@ class HevTunnelEngine(private val configDir: File) : TunnelEngine {
         val values = runCatching { TProxyService.TProxyGetStats() }.getOrNull()
             ?: return TunnelEngineStats()
         return TunnelEngineStats(
-            rxPackets = values.getOrNull(3)?.coerceAtLeast(0) ?: 0,
-            txPackets = values.getOrNull(1)?.coerceAtLeast(0) ?: 0,
+            txPackets = values.getOrNull(0)?.coerceAtLeast(0) ?: 0,
+            txBytes = values.getOrNull(1)?.coerceAtLeast(0),
+            rxPackets = values.getOrNull(2)?.coerceAtLeast(0) ?: 0,
+            rxBytes = values.getOrNull(3)?.coerceAtLeast(0),
         )
     }
 

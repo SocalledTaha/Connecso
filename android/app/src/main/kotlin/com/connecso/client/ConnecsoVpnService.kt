@@ -3,7 +3,9 @@ package com.connecso.client
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
+import android.widget.RemoteViews
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.VpnService
@@ -15,7 +17,6 @@ import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.os.Process
-import android.net.TrafficStats
 import android.os.SystemClock
 import android.util.Log
 import com.connecso.client.tunnel.ContunTunnelEngine
@@ -36,6 +37,13 @@ import java.net.Socket
 import java.net.URL
 import java.util.concurrent.Executors
 import java.util.concurrent.Callable
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Owns Android's TUN descriptor, HEV tun2socks, and the pinned Xray runtime.
@@ -45,18 +53,31 @@ class ConnecsoVpnService : VpnService(), DialerController {
     private val worker = Executors.newSingleThreadExecutor()
     // Disconnect must not wait behind a queued probe/health verification.
     private val stopWorker = Executors.newSingleThreadExecutor()
+    private val notificationWorker: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
+    private val pingWorker: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
+    private val speedTestWorker = Executors.newSingleThreadExecutor()
+    private val speedTestInProgress = AtomicBoolean(false)
+    @Volatile private var notificationRefresh: ScheduledFuture<*>? = null
+    @Volatile private var periodicPing: ScheduledFuture<*>? = null
     @Volatile private var tun: ParcelFileDescriptor? = null
     @Volatile private var coreStarted = false
     @Volatile private var activeXrayConfig: String? = null
     @Volatile private var dnsConfigured = false
-    @Volatile private var trafficUploadBaseline = TrafficStats.UNSUPPORTED.toLong()
-    @Volatile private var trafficDownloadBaseline = TrafficStats.UNSUPPORTED.toLong()
     @Volatile private var dataplaneState = DataplaneState.IDLE
     private lateinit var tunnelEngineManager: TunnelEngineManager
     private var activeTunnelConfig: TunnelEngineConfig? = null
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var availableNetwork: Network? = null
+    @Volatile private var notificationCountryName = ""
+    @Volatile private var notificationCountryCode = ""
+    @Volatile private var notificationNodeId = ""
+    @Volatile private var notificationPing = -1L
+    @Volatile private var lastNotificationUpload = -1L
+    @Volatile private var lastNotificationDownload = -1L
+    @Volatile private var notificationUploadRate = 0L
+    @Volatile private var notificationDownloadRate = 0L
+    @Volatile private var pingInProgress = false
 
     override fun onCreate() {
         super.onCreate()
@@ -79,8 +100,32 @@ class ConnecsoVpnService : VpnService(), DialerController {
         val requestId = intent.getStringExtra(EXTRA_REQUEST_ID).orEmpty()
         when (action) {
             ACTION_START -> {
+                notificationCountryName = intent.getStringExtra(EXTRA_COUNTRY_NAME).orEmpty()
+                notificationCountryCode = intent.getStringExtra(EXTRA_COUNTRY_CODE).orEmpty()
+                notificationNodeId = intent.getStringExtra(EXTRA_NODE_ID).orEmpty()
+                notificationPing = -1L
+                lastNotificationUpload = -1L
+                lastNotificationDownload = -1L
+                notificationUploadRate = 0L
+                notificationDownloadRate = 0L
+                periodicPing?.cancel(false)
                 enterForeground()
                 worker.execute { startVpn(intent, requestId) }
+            }
+            ACTION_NOTIFICATION_PING -> worker.execute {
+                if (!pingInProgress) {
+                    pingInProgress = true
+                    try {
+                        val startedAt = SystemClock.elapsedRealtime()
+                        val result = if (coreStarted && tunnelEngineManager.isRunning()) {
+                            measureActiveProxy(notificationNodeId, notificationCountryCode, startedAt)
+                        } else ProbeMeasurement(false, -1L)
+                        notificationPing = if (result.success) result.latencyMs else -1L
+                        updateConnectionNotification()
+                    } finally {
+                        pingInProgress = false
+                    }
+                }
             }
             ACTION_PROBE -> worker.execute {
                 val config = intent?.getStringExtra(EXTRA_CONFIG)
@@ -115,7 +160,38 @@ class ConnecsoVpnService : VpnService(), DialerController {
                 )
                 if (!coreStarted) stopSelf(startId)
             }
+            ACTION_SPEED_TEST -> {
+                if (!speedTestInProgress.compareAndSet(false, true)) {
+                    sendResult(requestId, OP_SPEED_TEST, success = false, error = "A speed test is already running.")
+                } else speedTestWorker.execute {
+                    if (!coreStarted || !tunnelEngineManager.isRunning() || !xrayRunning()) {
+                        sendResult(requestId, OP_SPEED_TEST, success = false, error = "The active Xray connection is not ready.")
+                        speedTestInProgress.set(false)
+                    } else {
+                        try {
+                            val measurement = performSpeedTest()
+                            sendResult(
+                                requestId,
+                                OP_SPEED_TEST,
+                                success = true,
+                                speedMbps = measurement.first,
+                                speedBytes = measurement.second,
+                                speedSeconds = measurement.third,
+                                speedConnections = SPEED_TEST_CONNECTIONS,
+                            )
+                        } catch (error: Exception) {
+                            sendResult(requestId, OP_SPEED_TEST, success = false, error = error.message ?: "Speed test failed.")
+                        } finally {
+                            speedTestInProgress.set(false)
+                        }
+                    }
+                }
+            }
             ACTION_STOP -> stopWorker.execute {
+                notificationRefresh?.cancel(false)
+                notificationRefresh = null
+                periodicPing?.cancel(false)
+                periodicPing = null
                 runCatching { QuickTileStore.setActive(this, false) }
                 stopCore()
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -147,6 +223,9 @@ class ConnecsoVpnService : VpnService(), DialerController {
         runCatching { QuickTileStore.setActive(this, false) }
         worker.shutdown()
         stopWorker.shutdownNow()
+        notificationWorker.shutdownNow()
+        pingWorker.shutdownNow()
+        speedTestWorker.shutdownNow()
         super.onDestroy()
     }
 
@@ -218,12 +297,11 @@ class ConnecsoVpnService : VpnService(), DialerController {
             // the previous engine and TUN before a new session is established.
             stopCore()
             val requestedMode = intent.getStringExtra(EXTRA_SPLIT_MODE) ?: SPLIT_OFF
-            // CONNECSO uses exclusion-based split tunneling.  Older builds
-            // could persist `includeSelected`, which turns Android's VPN into
-            // an allowlist and silently bypasses every other application.
-            // Normalize every enabled mode to full-device VPN plus explicit
-            // exclusions so stale policies cannot narrow capture.
-            val mode = if (requestedMode == SPLIT_OFF) SPLIT_OFF else SPLIT_EXCLUDE
+            val mode = when (requestedMode) {
+                SPLIT_INCLUDE -> SPLIT_INCLUDE
+                SPLIT_EXCLUDE -> SPLIT_EXCLUDE
+                else -> SPLIT_OFF
+            }
             val selectedPackages = if (mode == SPLIT_OFF) emptyList()
                 else intent.getStringArrayListExtra(EXTRA_SPLIT_PACKAGES).orEmpty()
 
@@ -234,6 +312,8 @@ class ConnecsoVpnService : VpnService(), DialerController {
                     mode,
                     selectedPackages,
                     nodeId,
+                    notificationCountryName,
+                    notificationCountryCode,
                 )
             }.onFailure {
                 Log.w(TAG, "event=quick_tile_profile_save_failed")
@@ -259,18 +339,16 @@ class ConnecsoVpnService : VpnService(), DialerController {
                 builder.setMetered(false)
             }
 
-            val excludedPackages = if (mode == SPLIT_EXCLUDE) {
-                selectedPackages.filterNot { it == packageName }.distinct()
-            } else {
-                emptyList()
-            }
-            Log.i(TAG, "VPN app routing mode=${if (excludedPackages.isEmpty()) "FULL" else "SPLIT_EXCLUDE"}")
-            if (excludedPackages.isEmpty()) {
-                Log.i(TAG, "VPN excluded packages=none")
-            } else {
-                excludedPackages.forEach { packageName ->
-                    Log.i(TAG, "VPN excluded package=$packageName")
-                    builder.addDisallowedApplication(packageName)
+            val routedPackages = selectedPackages.filterNot { it == packageName }.distinct()
+            Log.i(TAG, "VPN app routing mode=$mode selected=${routedPackages.size}")
+            when (mode) {
+                SPLIT_INCLUDE -> routedPackages.forEach { app ->
+                    Log.i(TAG, "VPN allowed package=$app")
+                    builder.addAllowedApplication(app)
+                }
+                SPLIT_EXCLUDE -> routedPackages.forEach { app ->
+                    Log.i(TAG, "VPN excluded package=$app")
+                    builder.addDisallowedApplication(app)
                 }
             }
 
@@ -282,9 +360,6 @@ class ConnecsoVpnService : VpnService(), DialerController {
             invoke("runXray", JSONObject().put("xrayJson", configText))
             coreStarted = true
             activeXrayConfig = configText
-            trafficUploadBaseline = TrafficStats.getUidTxBytes(Process.myUid())
-            trafficDownloadBaseline = TrafficStats.getUidRxBytes(Process.myUid())
-
             var ready = false
             for (attempt in 0 until 40) {
                 if (xrayRunning()) {
@@ -329,6 +404,10 @@ class ConnecsoVpnService : VpnService(), DialerController {
             }
             dataplaneState = tunnelEngineManager.state
             Log.i(TAG, "event=tunnel.started engine=${tunnelEngineManager.activeName()} choice=$engineChoice stats=${tunnelEngineManager.stats()}")
+            // Promote the foreground placeholder to the live notification as
+            // soon as the tunnel engine is up. Full dataplane verification can
+            // take several seconds and should not delay the user's controls.
+            updateConnectionNotification()
 
             dataplaneState = DataplaneState.DATAPLANE_VERIFYING
             tunnelEngineManager.markVerifying()
@@ -340,6 +419,9 @@ class ConnecsoVpnService : VpnService(), DialerController {
             val ipv6State = if (VpnDataplaneConfig.IPV6_ENABLED) "CAPTURED" else "DISABLED"
             Log.i(TAG, "dataplane core=READY tun=READY engine=${tunnelEngineManager.activeName()} tcp=READY udp=ENABLED ipv6=$ipv6State dns=CONFIGURED")
             runCatching { QuickTileStore.setActive(this, true) }
+            updateConnectionNotification()
+            startNotificationRefresh()
+            startPeriodicPing()
             sendResult(requestId, OP_START, success = true)
         } catch (error: Exception) {
             stopCore()
@@ -497,7 +579,13 @@ class ConnecsoVpnService : VpnService(), DialerController {
         Log.i("CONNECSO_CONNECT_TRACE", "ping.raw_result node=$nodeId country=$country pingBatch=${reportedDelay}ms total=${total}ms dns=unknown tcp=unknown tls=unknown ttfb=unknown retries=unknown timeoutContribution=${if (reportedDelay < 0) total else 0}ms")
         // pingBatch is a cold setup measurement. It is valid for reachability
         // only and must never enter the authoritative warm-TTFB latency path.
-        return ProbeMeasurement(success && delay >= 0 && delay < 10_000, -1L)
+        // For a non-active destination, pingBatch is the live RTT for that
+        // node's own Xray outbound. The active destination uses the warmed
+        // HTTP TTFB path above; never discard the result for other countries.
+        return ProbeMeasurement(
+            success && delay >= 0 && delay < 10_000,
+            if (success && delay >= 0 && delay < 10_000) delay else -1L,
+        )
     }
 
     /** Measures only the Google HTTP response time through the active Xray SOCKS inbound. */
@@ -558,19 +646,17 @@ class ConnecsoVpnService : VpnService(), DialerController {
 
     private fun readStats(): Pair<Long, Long>? {
         if (!coreStarted) return null
-        val nativeStats = readXrayStats()
-        if (nativeStats != null) return nativeStats
-        if (tunnelEngineManager.isRunning()) {
-            val tunnelStats = tunnelEngineManager.stats()
-            if (tunnelStats.rxPackets > 0 || tunnelStats.txPackets > 0) {
-                return tunnelStats.txPackets to tunnelStats.rxPackets
-            }
-        }
-        val upload = TrafficStats.getUidTxBytes(Process.myUid())
-        val download = TrafficStats.getUidRxBytes(Process.myUid())
-        if (trafficUploadBaseline < 0 || trafficDownloadBaseline < 0 || upload < 0 || download < 0) return null
-        return (upload - trafficUploadBaseline).coerceAtLeast(0) to
-            (download - trafficDownloadBaseline).coerceAtLeast(0)
+        // Session usage must describe traffic that entered this tunnel's Xray
+        // SOCKS inbound. Preserve the original v1 fallback order: when Xray's
+        // metrics endpoint is unavailable, use HEV's TUN-interface byte
+        // counters. Do not fall back to UID totals, which include unrelated
+        // app/control traffic and inflated this value on some devices.
+        readXrayStats()?.let { return it }
+        val tunnelStats = tunnelEngineManager.stats()
+        val contunActive = tunnelEngineManager.activeName() == "Contun"
+        val upload = (if (contunActive) tunnelStats.rxBytes else tunnelStats.txBytes) ?: return null
+        val download = (if (contunActive) tunnelStats.txBytes else tunnelStats.rxBytes) ?: return null
+        return upload to download
     }
 
     private fun readXrayStats(): Pair<Long, Long>? {
@@ -590,6 +676,86 @@ class ConnecsoVpnService : VpnService(), DialerController {
         } finally {
             connection?.disconnect()
         }
+    }
+
+    /** Runs downloads through the SOCKS inbound owned by this active Xray core. */
+    private fun performSpeedTest(): Triple<Double, Long, Double> {
+        val started = System.nanoTime()
+        val durationMs = 8_000L
+        val deadline = started + TimeUnit.MILLISECONDS.toNanos(durationMs)
+        val totalBytes = AtomicLong()
+        val bytesBySecond = ConcurrentHashMap<Long, AtomicLong>()
+        val lastError = AtomicReference("No speed-test endpoint responded.")
+        val unavailableEndpoints = ConcurrentHashMap.newKeySet<String>()
+        val endpoints = listOf(
+            "https://speed.cloudflare.com/__down?bytes=100000000",
+            "https://speedtest.tele2.net/5MB.zip",
+            "https://proof.ovh.net/files/10Mb.dat",
+        )
+        val workers = Executors.newFixedThreadPool(SPEED_TEST_CONNECTIONS)
+        try {
+            val tasks = (0 until SPEED_TEST_CONNECTIONS).map { lane ->
+                Callable {
+                    var requestNumber = lane
+                    val proxy = Proxy(
+                        Proxy.Type.SOCKS,
+                        InetSocketAddress(LOCAL_XRAY_HOST, LOCAL_XRAY_PORT),
+                    )
+                    while (System.nanoTime() < deadline && coreStarted) {
+                        val available = endpoints.filterNot(unavailableEndpoints::contains)
+                        if (available.isEmpty()) break
+                        val endpoint = available[requestNumber % available.size]
+                        val cacheBuster = "${System.currentTimeMillis()}-$lane-$requestNumber"
+                        val separator = if (endpoint.contains('?')) '&' else '?'
+                        var connection: HttpURLConnection? = null
+                        try {
+                            connection = URL("$endpoint$separator" + "cacheBust=$cacheBuster")
+                                .openConnection(proxy) as HttpURLConnection
+                            connection.connectTimeout = 5_000
+                            connection.readTimeout = 5_000
+                            connection.instanceFollowRedirects = true
+                            connection.useCaches = false
+                            connection.setRequestProperty("Cache-Control", "no-cache")
+                            connection.setRequestProperty("User-Agent", "Connecso-Mobile-Client")
+                            val response = connection.responseCode
+                            if (response !in 200..299) {
+                                if (response == 403 || response == 429) unavailableEndpoints.add(endpoint)
+                                lastError.set(
+                                    if (response == 429) "Speed-test endpoint is rate-limiting requests."
+                                    else "Speed-test server returned HTTP $response.",
+                                )
+                            } else {
+                                val buffer = ByteArray(64 * 1024)
+                                connection.inputStream.use { input ->
+                                    while (System.nanoTime() < deadline && coreStarted) {
+                                        val count = input.read(buffer)
+                                        if (count < 0) break
+                                        val bucket = TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - started)
+                                        bytesBySecond.computeIfAbsent(bucket) { AtomicLong() }.addAndGet(count.toLong())
+                                        totalBytes.addAndGet(count.toLong())
+                                    }
+                                }
+                            }
+                        } catch (error: Exception) {
+                            lastError.set(error.message ?: "Speed-test request failed.")
+                        } finally {
+                            connection?.disconnect()
+                        }
+                        requestNumber += 1
+                    }
+                }
+            }
+            workers.invokeAll(tasks, durationMs + 2_000, TimeUnit.MILLISECONDS)
+        } finally {
+            workers.shutdownNow()
+        }
+
+        val elapsedSeconds = (System.nanoTime() - started) / 1_000_000_000.0
+        val peakBytesPerSecond = bytesBySecond.values.maxOfOrNull { it.get() } ?: 0L
+        if (totalBytes.get() <= 0L || peakBytesPerSecond <= 0L) {
+            throw IllegalStateException(lastError.get())
+        }
+        return Triple(peakBytesPerSecond * 8.0 / 1_000_000.0, totalBytes.get(), elapsedSeconds)
     }
 
     private fun stopCore() {
@@ -641,10 +807,15 @@ class ConnecsoVpnService : VpnService(), DialerController {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
         }
-            .setSmallIcon(android.R.drawable.stat_sys_warning)
-            .setContentTitle("CONNECSO")
+            .setSmallIcon(R.drawable.connecso_logo)
+            .setContentTitle(
+                notificationCountryCode.takeIf { it.length == 2 }?.let(::countryFlag)?.let { "$it  $notificationCountryName" }
+                    ?: notificationCountryName.ifBlank { "CONNECSO" },
+            )
             .setContentText("VPN connection is active")
             .setOngoing(true)
+            .setShowWhen(false)
+            .setWhen(0)
             .build()
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(
@@ -657,6 +828,152 @@ class ConnecsoVpnService : VpnService(), DialerController {
         }
     }
 
+    private fun startNotificationRefresh() {
+        notificationRefresh?.cancel(false)
+        notificationRefresh = notificationWorker.scheduleAtFixedRate({
+            if (!coreStarted || !tunnelEngineManager.isRunning()) return@scheduleAtFixedRate
+            val totals = readStats() ?: return@scheduleAtFixedRate
+            val uploadRate = if (lastNotificationUpload < 0) 0L else (totals.first - lastNotificationUpload).coerceAtLeast(0)
+            val downloadRate = if (lastNotificationDownload < 0) 0L else (totals.second - lastNotificationDownload).coerceAtLeast(0)
+            lastNotificationUpload = totals.first
+            lastNotificationDownload = totals.second
+            notificationUploadRate = uploadRate
+            notificationDownloadRate = downloadRate
+            updateConnectionNotification(uploadRate, downloadRate)
+        }, 0, 2, TimeUnit.SECONDS)
+    }
+
+    private fun startPeriodicPing() {
+        periodicPing?.cancel(false)
+        periodicPing = pingWorker.scheduleAtFixedRate({
+            if (!coreStarted || !tunnelEngineManager.isRunning() || pingInProgress) return@scheduleAtFixedRate
+            pingInProgress = true
+            try {
+                val result = measureActiveProxy(
+                    notificationNodeId,
+                    notificationCountryCode,
+                    SystemClock.elapsedRealtime(),
+                )
+                notificationPing = if (result.success) result.latencyMs else -1L
+                updateConnectionNotification()
+            } catch (error: Exception) {
+                Log.w(TAG, "event=notification_ping_failed failureType=${error.javaClass.simpleName}")
+            } finally {
+                pingInProgress = false
+            }
+        }, 0, 10, TimeUnit.SECONDS)
+    }
+
+    private fun updateConnectionNotification(
+        uploadRate: Long = notificationUploadRate,
+        downloadRate: Long = notificationDownloadRate,
+    ) {
+        val manager = getSystemService(Service.NOTIFICATION_SERVICE) as NotificationManager
+        val country = notificationCountryName.ifBlank { "Connected" }
+        val code = notificationCountryCode.uppercase().takeIf { it.length == 2 }
+        val flag = code?.let(::countryFlag).orEmpty()
+        val ping = if (notificationPing >= 0) "${notificationPing} ms" else "—"
+        val title = if (flag.isEmpty()) country else "$flag  $country"
+        val expanded = "$title\n↑ ${formatRate(uploadRate)}  ↓ ${formatRate(downloadRate)}\nPing: $ping"
+        val pingIntent = PendingIntent.getService(
+            this, 6402,
+            Intent(this, ConnecsoVpnService::class.java).setAction(ACTION_NOTIFICATION_PING),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val stopIntent = PendingIntent.getService(
+            this, 6403,
+            Intent(this, ConnecsoVpnService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val openIntent = PendingIntent.getActivity(
+            this,
+            6404,
+            packageManager.getLaunchIntentForPackage(packageName)
+                ?.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                ?: Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+        val expandedView = RemoteViews(packageName, R.layout.notification_expanded).apply {
+            setTextViewText(R.id.notification_expanded_title, title)
+            setTextViewText(
+                R.id.notification_expanded_details,
+                "↑ ${formatRate(uploadRate)}  ↓ ${formatRate(downloadRate)}     Ping: $ping",
+            )
+            setImageViewResource(R.id.notification_ping_icon, R.drawable.ic_notification_ping)
+            setImageViewResource(R.id.notification_disconnect_icon, R.drawable.ic_notification_disconnect)
+            setTextViewText(R.id.notification_ping_label, "Ping")
+            setTextViewText(R.id.notification_disconnect_label, "Disconnect")
+            setOnClickPendingIntent(R.id.notification_ping_button, pingIntent)
+            setOnClickPendingIntent(R.id.notification_disconnect_button, stopIntent)
+            val textColor = if ((resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) == android.content.res.Configuration.UI_MODE_NIGHT_YES) {
+                android.graphics.Color.WHITE
+            } else {
+                android.graphics.Color.BLACK
+            }
+            setTextColor(R.id.notification_expanded_title, textColor)
+            setTextColor(R.id.notification_expanded_details, textColor)
+            setTextColor(R.id.notification_ping_label, textColor)
+            setTextColor(R.id.notification_disconnect_label, textColor)
+        }
+        val compactView = RemoteViews(packageName, R.layout.notification_compact).apply {
+            setTextViewText(R.id.notification_compact_country, title)
+            setTextViewText(R.id.notification_compact_upload, "↑ ${formatRate(uploadRate)}")
+            setTextViewText(R.id.notification_compact_download, "↓ ${formatRate(downloadRate)}")
+            setTextViewText(R.id.notification_compact_ping, "⚡ $ping")
+            setImageViewResource(R.id.notification_compact_ping_button, R.drawable.ic_notification_ping)
+            setImageViewResource(R.id.notification_compact_disconnect_button, R.drawable.ic_notification_disconnect)
+            setOnClickPendingIntent(R.id.notification_compact_ping_button, pingIntent)
+            setOnClickPendingIntent(R.id.notification_compact_disconnect_button, stopIntent)
+            val textColor = if ((resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) == android.content.res.Configuration.UI_MODE_NIGHT_YES) {
+                android.graphics.Color.WHITE
+            } else {
+                android.graphics.Color.BLACK
+            }
+            setTextColor(R.id.notification_compact_upload, textColor)
+            setTextColor(R.id.notification_compact_download, textColor)
+            setTextColor(R.id.notification_compact_ping, textColor)
+            setTextColor(R.id.notification_compact_country, textColor)
+        }
+        val notification = builder
+            .setSmallIcon(R.drawable.connecso_logo)
+            .setContentTitle(title)
+            .setContentText(null)
+            .setContentIntent(openIntent)
+            .setStyle(Notification.DecoratedCustomViewStyle())
+            .setCustomContentView(compactView)
+            .setCustomBigContentView(expandedView)
+            .setCustomHeadsUpContentView(compactView)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
+            .setWhen(0)
+            .build()
+        manager.notify(NOTIFICATION_ID, notification)
+    }
+
+    private fun countryFlag(code: String): String = buildString {
+        code.forEach { char -> appendCodePoint(0x1F1E6 + (char.code - 'A'.code)) }
+    }
+
+    private fun formatRate(bytesPerSecond: Long): String {
+        var value = bytesPerSecond.coerceAtLeast(0).toDouble()
+        val units = arrayOf("B/s", "KB/s", "MB/s", "GB/s", "TB/s")
+        var unitIndex = 0
+        // Promote before rounding so values that would render as 100.00
+        // never exceed the requested two-digit display range.
+        while (value >= 99.995 && unitIndex < units.lastIndex) {
+            value /= 1_000.0
+            unitIndex++
+        }
+        return "${String.format(java.util.Locale.US, "%.2f", value)} ${units[unitIndex]}"
+    }
+
     private fun sendResult(
         requestId: String,
         operation: String,
@@ -665,6 +982,10 @@ class ConnecsoVpnService : VpnService(), DialerController {
         uploadBytes: Long? = null,
         downloadBytes: Long? = null,
         latencyMs: Long? = null,
+        speedMbps: Double? = null,
+        speedBytes: Long? = null,
+        speedSeconds: Double? = null,
+        speedConnections: Int? = null,
     ) {
         val result = Intent(ACTION_RESULT)
             .setPackage(packageName)
@@ -675,6 +996,10 @@ class ConnecsoVpnService : VpnService(), DialerController {
         if (uploadBytes != null) result.putExtra(EXTRA_UPLOAD_BYTES, uploadBytes)
         if (downloadBytes != null) result.putExtra(EXTRA_DOWNLOAD_BYTES, downloadBytes)
         if (latencyMs != null) result.putExtra(EXTRA_LATENCY_MS, latencyMs)
+        if (speedMbps != null) result.putExtra(EXTRA_SPEED_MBPS, speedMbps)
+        if (speedBytes != null) result.putExtra(EXTRA_SPEED_BYTES, speedBytes)
+        if (speedSeconds != null) result.putExtra(EXTRA_SPEED_SECONDS, speedSeconds)
+        if (speedConnections != null) result.putExtra(EXTRA_SPEED_CONNECTIONS, speedConnections)
         sendBroadcast(result)
     }
 
@@ -685,11 +1010,15 @@ class ConnecsoVpnService : VpnService(), DialerController {
         const val ACTION_PROBE = "com.connecso.client.VPN_PROBE"
         const val ACTION_VERIFY = "com.connecso.client.VPN_VERIFY"
         const val ACTION_STATS = "com.connecso.client.VPN_STATS"
+        const val ACTION_SPEED_TEST = "com.connecso.client.VPN_SPEED_TEST"
         const val ACTION_STOP = "com.connecso.client.VPN_STOP"
+        const val ACTION_NOTIFICATION_PING = "com.connecso.client.VPN_NOTIFICATION_PING"
 
         const val EXTRA_REQUEST_ID = "requestId"
         const val EXTRA_CONFIG = "config"
         const val EXTRA_NODE_ID = "nodeId"
+        const val EXTRA_COUNTRY_NAME = "countryName"
+        const val EXTRA_COUNTRY_CODE = "countryCode"
         const val EXTRA_SPLIT_MODE = "splitTunnelMode"
         const val EXTRA_SPLIT_PACKAGES = "splitTunnelPackages"
         const val EXTRA_OPERATION = "operation"
@@ -698,6 +1027,10 @@ class ConnecsoVpnService : VpnService(), DialerController {
         const val EXTRA_UPLOAD_BYTES = "uploadBytes"
         const val EXTRA_DOWNLOAD_BYTES = "downloadBytes"
         const val EXTRA_LATENCY_MS = "latencyMs"
+        const val EXTRA_SPEED_MBPS = "speedMbps"
+        const val EXTRA_SPEED_BYTES = "speedBytes"
+        const val EXTRA_SPEED_SECONDS = "speedSeconds"
+        const val EXTRA_SPEED_CONNECTIONS = "speedConnections"
         const val EXTRA_TRACE_NODE_ID = "traceNodeId"
         const val EXTRA_TRACE_COUNTRY = "traceCountry"
         const val EXTRA_TUNNEL_ENGINE = "tunnelEngine"
@@ -706,6 +1039,7 @@ class ConnecsoVpnService : VpnService(), DialerController {
         const val OP_PROBE = "probe"
         const val OP_VERIFY = "verify"
         const val OP_STATS = "stats"
+        const val OP_SPEED_TEST = "speedTest"
         const val OP_STOP = "stop"
 
         private const val API_VERSION = 3
@@ -715,8 +1049,10 @@ class ConnecsoVpnService : VpnService(), DialerController {
         private const val LOCAL_XRAY_PORT = VpnDataplaneConfig.XRAY_SOCKS_PORT
         private const val PING_URL = "https://www.google.com/generate_204"
         private const val PING_TIMEOUT_MS = 8_000
+        private const val SPEED_TEST_CONNECTIONS = 4
         private const val METRICS_PORT = 49227
         private const val SPLIT_EXCLUDE = "excludeSelected"
+        private const val SPLIT_INCLUDE = "includeSelected"
         private const val SPLIT_OFF = "off"
         private const val CHANNEL_ID = "connecso_vpn"
         private const val NOTIFICATION_ID = 6401

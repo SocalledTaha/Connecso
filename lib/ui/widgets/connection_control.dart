@@ -115,6 +115,7 @@ class _ConnectionControlState extends State<ConnectionControl>
         hint: widget.actionLabel,
         enabled: widget.onPressed != null,
         child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
           onTap: _handleTap,
           child: ExcludeSemantics(
             child: SizedBox(

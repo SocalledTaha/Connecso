@@ -60,6 +60,13 @@ jobs:
           git -C work/libXray sparse-checkout set build
           git -C work/libXray checkout --detach 50b95979f5db551bd273165cf469e5daaf791341
           test "$(git -C work/libXray rev-parse HEAD)" = "50b95979f5db551bd273165cf469e5daaf791341"
+      - name: Fetch pinned Xray-core
+        shell: bash
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/XTLS/Xray-core.git work/Xray-core
+          git -C work/Xray-core fetch --depth 1 origin 92ccc939aaf4f8965f369cf0b142e005aeaa11d5
+          git -C work/Xray-core checkout --detach 92ccc939aaf4f8965f369cf0b142e005aeaa11d5
+          test "$(git -C work/Xray-core rev-parse HEAD)" = "92ccc939aaf4f8965f369cf0b142e005aeaa11d5"
       - name: Identify libXray build scripts
         id: libxray_script
         shell: bash
@@ -72,7 +79,7 @@ jobs:
         with:
           path: work/artifacts/libXray.aar
           key: >-
-            ${{ runner.os }}-libxray-50b95979f5db551bd273165cf469e5daaf791341-go-1.27.1-java-17-api24-gomobile-v0.0.0-20260908204917-8b95e45f8d3e-ndk-27.2.12479018-build-${{ steps.libxray_script.outputs.hash }}
+            ${{ runner.os }}-libxray-50b95979f5db551bd273165cf469e5daaf791341-xray-92ccc939aaf4f8965f369cf0b142e005aeaa11d5-go-1.27.1-java-17-api24-gomobile-v0.0.0-20260908204917-8b95e45f8d3e-ndk-27.2.12479018-build-${{ steps.libxray_script.outputs.hash }}
       - name: Verify cached libXray AAR
         if: steps.libxray_cache.outputs.cache-hit == 'true'
         run: test -s work/artifacts/libXray.aar
@@ -94,13 +101,13 @@ jobs:
           test -f "$ndk/meta/platforms.json"
           echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$ndk" >> "$GITHUB_ENV"
-      - name: Build pinned libXray Android binding
+      - name: Build libXray Android binding with pinned Xray-core
         if: steps.libxray_cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           git -C work/libXray sparse-checkout disable
           cd work/libXray
-          LIBXRAY_GOMOBILE_VERSION=v0.0.0-20260908204917-8b95e45f8d3e python3 build/main.py android
+          LIBXRAY_GOMOBILE_VERSION=v0.0.0-20260908204917-8b95e45f8d3e python3 build/main.py android local
           test -s libXray.aar
           mkdir -p "$GITHUB_WORKSPACE/work/artifacts"
           cp libXray.aar "$GITHUB_WORKSPACE/work/artifacts/libXray.aar"
@@ -112,10 +119,10 @@ jobs:
         with:
           path: work/artifacts/libXray.aar
           key: >-
-            ${{ runner.os }}-libxray-50b95979f5db551bd273165cf469e5daaf791341-go-1.27.1-java-17-api24-gomobile-v0.0.0-20260908204917-8b95e45f8d3e-ndk-27.2.12479018-build-${{ steps.libxray_script.outputs.hash }}
+            ${{ runner.os }}-libxray-50b95979f5db551bd273165cf469e5daaf791341-xray-92ccc939aaf4f8965f369cf0b142e005aeaa11d5-go-1.27.1-java-17-api24-gomobile-v0.0.0-20260908204917-8b95e45f8d3e-ndk-27.2.12479018-build-${{ steps.libxray_script.outputs.hash }}
       - name: Remove libXray source checkout
         if: always()
-        run: rm -rf work/libXray
+        run: rm -rf work/libXray work/Xray-core
       - name: Build pinned HEV API 24 Android runtime
         run: python tool/build_hev_android.py
       - run: flutter create --platforms android --org com.connecso --project-name connecso_client .
@@ -191,7 +198,7 @@ jobs:
       - name: Verify release APK signatures
         shell: bash
         env:
-          EXPECTED_SIGNING_SHA256: ${{ vars.CONNECSO_SIGNING_SHA256 }}
+          EXPECTED_SIGNING_SHA256: ${{ vars.CONNECSO_SIGNING_SHA256 || 'CA8C716A13138555C60D580EB5002F76B92871B2A72B236FCB653F9112F0D475' }}
         run: |
           set -euo pipefail
           apksigner="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"

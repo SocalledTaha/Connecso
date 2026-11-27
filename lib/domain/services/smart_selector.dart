@@ -133,8 +133,20 @@ class SmartSelector {
     return initial - penalty;
   }
 
-  int tier(VpnNode node) {
+  int tier(VpnNode node, {Set<String> preferredCountryCodes = const {}}) {
     final country = _resolvedCountry(node);
+    if (preferredCountryCodes.isNotEmpty) {
+      if (preferredCountryCodes
+          .map((code) => code.toLowerCase())
+          .contains(country)) {
+        return 1;
+      }
+      return _historicalTier(country) + 1;
+    }
+    return _historicalTier(country);
+  }
+
+  int _historicalTier(String country) {
     if ({
       'nl',
       'netherlands',

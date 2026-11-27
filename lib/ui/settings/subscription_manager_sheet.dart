@@ -120,6 +120,9 @@ class _SubscriptionManagerSheetState extends State<SubscriptionManagerSheet> {
   Future<void> _edit(SavedSubscription profile, AppStrings strings) async {
     final result = await showDialog<_SubscriptionEdit>(
       context: context,
+      animationStyle: MediaQuery.disableAnimationsOf(context)
+          ? AnimationStyle.noAnimation
+          : null,
       builder: (_) => _EditSubscriptionDialog(
         initialName: profile.name,
         initialEndpoint: profile.endpoint ?? '',
@@ -187,6 +190,9 @@ class _SubscriptionManagerSheetState extends State<SubscriptionManagerSheet> {
   Future<void> _delete(SavedSubscription profile, AppStrings strings) async {
     final confirmed = await showDialog<bool>(
       context: context,
+      animationStyle: MediaQuery.disableAnimationsOf(context)
+          ? AnimationStyle.noAnimation
+          : null,
       builder: (dialogContext) => AlertDialog(
         title: Text(strings.deleteSubscription),
         content: Text(strings.deleteSubscriptionMessage(profile.name)),

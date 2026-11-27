@@ -35,26 +35,33 @@ class SubscriptionHttpResponse {
   final Map<String, String> headers;
 }
 
+typedef SubscriptionFetcher =
+    Future<SubscriptionHttpResponse> Function(
+      Uri endpoint,
+      Map<String, String> requestHeaders,
+    );
+
 class SubscriptionRepository {
   SubscriptionRepository({
     required SubscriptionCache cache,
     SubscriptionParser parser = const SubscriptionParser(),
     HttpClient? client,
-    Future<SubscriptionHttpResponse> Function(Uri endpoint)? directFetcher,
-    Future<SubscriptionHttpResponse> Function(Uri endpoint)?
-    currentRouteFetcher,
+    SubscriptionFetcher? directFetcher,
+    SubscriptionFetcher? currentRouteFetcher,
+    Future<Map<String, String>> Function()? requestHeadersProvider,
   }) : _cache = cache,
        _parser = parser,
        _client = client ?? HttpClient(),
        _directFetcher = directFetcher,
-       _currentRouteFetcher = currentRouteFetcher;
+       _currentRouteFetcher = currentRouteFetcher,
+       _requestHeadersProvider = requestHeadersProvider;
 
   final SubscriptionCache _cache;
   final SubscriptionParser _parser;
   final HttpClient _client;
-  final Future<SubscriptionHttpResponse> Function(Uri endpoint)? _directFetcher;
-  final Future<SubscriptionHttpResponse> Function(Uri endpoint)?
-  _currentRouteFetcher;
+  final SubscriptionFetcher? _directFetcher;
+  final SubscriptionFetcher? _currentRouteFetcher;
+  final Future<Map<String, String>> Function()? _requestHeadersProvider;
 
   Future<List<VpnNode>> cachedNodes(String subscriptionId) =>
       _cache.readNodes(subscriptionId);
@@ -78,9 +85,9 @@ class SubscriptionRepository {
     subscriptionId: subscriptionId,
     fetcher: _directFetcher == null
         ? _fetchWithClient
-        : (uri) async {
+        : (uri, requestHeaders) async {
             try {
-              return await _directFetcher!(uri);
+              return await _directFetcher!(uri, requestHeaders);
             } catch (error, stackTrace) {
               // The Android underlying-network bridge is preferred so a
               // connected VPN cannot intercept subscription refreshes. Some
@@ -92,7 +99,7 @@ class SubscriptionRepository {
                 name: 'CONNECSO/SUBSCRIPTION',
                 stackTrace: stackTrace,
               );
-              return _fetchWithClient(uri);
+              return _fetchWithClient(uri, requestHeaders);
             }
           },
   );
@@ -113,7 +120,7 @@ class SubscriptionRepository {
   Future<SubscriptionRefreshResult> _refresh(
     Uri endpoint, {
     required String subscriptionId,
-    required Future<SubscriptionHttpResponse> Function(Uri) fetcher,
+    required SubscriptionFetcher fetcher,
   }) async {
     if (endpoint.scheme != 'https' || endpoint.host.isEmpty) {
       throw ArgumentError.value(
@@ -122,7 +129,7 @@ class SubscriptionRepository {
         'An HTTPS subscription URL is required.',
       );
     }
-    final fetched = await fetcher(endpoint);
+    final fetched = await fetcher(endpoint, await _headersForRequest());
     final body = fetched.body;
     final headers = fetched.headers;
     final candidate = _parser.parse(body, subscriptionId: subscriptionId);
@@ -150,10 +157,19 @@ class SubscriptionRepository {
     );
   }
 
-  Future<SubscriptionHttpResponse> _fetchWithClient(Uri endpoint) async {
+  Future<Map<String, String>> _headersForRequest() async =>
+      await _requestHeadersProvider?.call() ?? const {};
+
+  Future<SubscriptionHttpResponse> _fetchWithClient(
+    Uri endpoint,
+    Map<String, String> requestHeaders,
+  ) async {
     final request = await _client
         .getUrl(endpoint)
         .timeout(const Duration(seconds: 12));
+    for (final header in requestHeaders.entries) {
+      request.headers.set(header.key, header.value);
+    }
     request.followRedirects = true;
     request.maxRedirects = 5;
     final response = await request.close().timeout(const Duration(seconds: 20));
@@ -222,15 +238,10 @@ class SubscriptionRepository {
     final previous = await _cache.readNodes(subscriptionId);
     if (previous.isEmpty) return candidate;
     final byId = {for (final node in previous) node.id: node};
-    final byEndpoint = {
-      for (final node in previous)
-        _historyKey(node): node,
-    };
+    final byEndpoint = {for (final node in previous) _historyKey(node): node};
     return candidate
         .map((node) {
-          final old =
-              byId[node.id] ??
-              byEndpoint[_historyKey(node)];
+          final old = byId[node.id] ?? byEndpoint[_historyKey(node)];
           if (old == null) return node;
           return VpnNode.fromJson({
             ...node.toJson(),

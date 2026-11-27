@@ -8,6 +8,8 @@ import 'android_vpn_adapter.dart';
 class XrayProxyCore implements ProxyCore, MeasuredNodeProbe {
   const XrayProxyCore(this._vpn);
 
+  static const releaseVersion = '26.10.21';
+
   final AndroidVpnAdapter _vpn;
 
   @override
@@ -23,7 +25,7 @@ class XrayProxyCore implements ProxyCore, MeasuredNodeProbe {
   };
 
   @override
-  String get version => 'libXray-v26.9.9';
+  String get version => 'libXray-v$releaseVersion';
 
   @override
   Future<void> initialize() => _vpn.initializeCore();

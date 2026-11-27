@@ -37,3 +37,4 @@ android/app/libs/
 artifacts/
 ci-*/
 .tmp/
+/dist/

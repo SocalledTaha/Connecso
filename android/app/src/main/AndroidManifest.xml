@@ -2,12 +2,20 @@
         <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <application android:allowBackup="false"
         android:label="CONNECSO"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
+        <provider
+            android:name=".AndroidUpdateFileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true" />
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -46,15 +54,32 @@
             android:permission="android.permission.BIND_VPN_SERVICE"
             android:process=":vpn_xray"
             android:foregroundServiceType="systemExempted"
+            android:stopWithTask="false"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
         </service>
         <service
+            android:name="com.connecso.client.DestinationPingService"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:process=":xray_destination_ping"
+            android:stopWithTask="false"
+            android:exported="false" />
+        <service
+            android:name="com.connecso.client.DestinationPingService2"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:process=":xray_destination_ping_2"
+            android:stopWithTask="false"
+            android:exported="false" />
+        <service
+            android:name="com.connecso.client.ConnecsoWidgetCollectionService"
+            android:permission="android.permission.BIND_REMOTEVIEWS"
+            android:exported="true" />
+        <service
             android:name="com.connecso.client.QuickSettingsVpnTileService"
             android:label="CONNECSO"
-            android:icon="@mipmap/ic_launcher"
+            android:icon="@drawable/connecso_logo"
             android:settingsActivity="com.connecso.client.MainActivity"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
             android:exported="true">
@@ -68,6 +93,16 @@
                 android:name="android.service.quicksettings.TOGGLEABLE_TILE"
                 android:value="true" />
         </service>
+        <receiver
+            android:name="com.connecso.client.ConnecsoWidgetProvider"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="com.connecso.client.WIDGET_TOGGLE" />
+                <action android:name="com.connecso.client.WIDGET_CONNECT_DESTINATION" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/connecso_widget_info" />
+        </receiver>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

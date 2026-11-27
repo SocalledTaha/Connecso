@@ -9,14 +9,62 @@ String? parseSubscriptionProfileTitle(
   final normalized = {
     for (final entry in headers.entries) entry.key.toLowerCase(): entry.value,
   };
-  final headerTitle = _cleanTitle(normalized['profile-title']);
-  if (headerTitle != null) return headerTitle;
+  for (final key in const [
+    'profile-title',
+    'x-profile-title',
+    'subscription-name',
+    'profile-name',
+    'x-subscription-name',
+  ]) {
+    final title = _cleanTitle(normalized[key]);
+    if (title != null) return title;
+  }
+  for (final candidate in _textCandidates(body)) {
+    try {
+      final decoded = jsonDecode(candidate);
+      final title = _findProfileTitle(decoded);
+      if (title != null) return title;
+    } on FormatException {
+      // Most feeds use a YAML-style metadata preamble rather than JSON.
+    }
+    final match = RegExp(
+      r'(?:^|\r?\n)\s*#?\s*(?:profile[-_ ]title|subscription[-_ ]name|profile[-_ ]name)\s*[:=]\s*([^\r\n]*)',
+      caseSensitive: false,
+    ).firstMatch(candidate.replaceFirst(RegExp(r'^\uFEFF'), ''));
+    final title = _cleanTitle(match?.group(1));
+    if (title != null) return title;
+  }
+  return null;
+}
 
-  final match = RegExp(
-    r'(?:^|\r?\n)\s*#profile-title\s*:\s*([^\r\n]*)',
-    caseSensitive: false,
-  ).firstMatch(body.replaceFirst(RegExp(r'^\uFEFF'), ''));
-  return _cleanTitle(match?.group(1));
+String? _findProfileTitle(Object? value) {
+  const keys = {
+    'profile-title',
+    'profile_title',
+    'subscription-name',
+    'subscription_name',
+    'profile-name',
+    'profile_name',
+  };
+  if (value is Map) {
+    for (final entry in value.entries) {
+      if (entry.key is String &&
+          keys.contains((entry.key as String).toLowerCase())) {
+        final title = _cleanTitle(entry.value?.toString());
+        if (title != null) return title;
+      }
+    }
+    for (final nested in value.values) {
+      final title = _findProfileTitle(nested);
+      if (title != null) return title;
+    }
+  } else if (value is List) {
+    for (final nested in value) {
+      final title = _findProfileTitle(nested);
+      if (title != null) return title;
+    }
+  }
+  return null;
 }
 
 String? parseSubscriptionSupportUrl(Map<String, String> headers, String body) =>
@@ -73,6 +121,13 @@ String? _parseMetadataValue(
     if (value != null) return value;
   }
   final source = body.replaceFirst(RegExp(r'^\uFEFF'), '');
+  if (bodyKeys.any(
+    (key) =>
+        const {'announce', 'announcement', 'profile-announce'}.contains(key),
+  )) {
+    final announcement = _parseMultilineAnnouncement(source, bodyKeys);
+    if (announcement != null) return announcement;
+  }
   for (final key in bodyKeys) {
     final match = RegExp(
       '^\\s*#?${RegExp.escape(key)}\\s*[:=]\\s*([^\\r\\n]*)',
@@ -81,6 +136,39 @@ String? _parseMetadataValue(
     ).firstMatch(source);
     final value = validator(match?.group(1));
     if (value != null) return value;
+  }
+  return null;
+}
+
+String? _parseMultilineAnnouncement(String source, List<String> keys) {
+  final lines = source
+      .replaceAll('\r\n', '\n')
+      .replaceAll('\r', '\n')
+      .split('\n');
+  final keyPattern = keys.map(RegExp.escape).join('|');
+  final startPattern = RegExp(
+    r'^\s*#?(' + keyPattern + r')\s*[:=]\s*(.*)$',
+    caseSensitive: false,
+  );
+  final nextMetadata = RegExp(
+    r'^\s*#?[a-z][a-z0-9-]*\s*[:=]',
+    caseSensitive: false,
+  );
+  final subscriptionLink = RegExp(
+    r'^\s*(?:vless|vmess|trojan|ss|socks|socks5|hysteria|hysteria2|tuic|wireguard|masque)://',
+    caseSensitive: false,
+  );
+  for (var index = 0; index < lines.length; index++) {
+    final first = startPattern.firstMatch(lines[index]);
+    if (first == null) continue;
+    final parts = <String>[first.group(2) ?? ''];
+    for (var next = index + 1; next < lines.length; next++) {
+      final line = lines[next];
+      if (nextMetadata.hasMatch(line) || subscriptionLink.hasMatch(line)) break;
+      parts.add(line);
+    }
+    final value = parts.join('\n').trim();
+    if (value.isNotEmpty) return _cleanAnnouncement(value);
   }
   return null;
 }
@@ -116,9 +204,11 @@ String? _cleanAnnouncement(String? raw) {
       return null;
     }
   }
-  value = value.trim();
+  value = value.replaceAll('\r\n', '\n').replaceAll('\r', '\n').trim();
   if (value.isEmpty || value.runes.length > 500) return null;
-  if (value.runes.any((rune) => rune < 0x20 && rune != 0x09)) return null;
+  if (value.runes.any((rune) => rune < 0x20 && rune != 0x09 && rune != 0x0a)) {
+    return null;
+  }
   return value;
 }
 
@@ -327,7 +417,10 @@ String? _cleanTitle(String? raw) {
     }
   }
   value = value.trim();
-  if (value.isEmpty || value.runes.length > 25) return null;
+  if (value.isEmpty || value.runes.length > 80) return null;
+  if (value.contains('://') || value.toLowerCase().startsWith('www.')) {
+    return null;
+  }
   if (value.runes.any((rune) => rune < 0x20 || rune == 0x7f)) return null;
   return value;
 }

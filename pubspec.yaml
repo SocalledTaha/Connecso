@@ -1,7 +1,7 @@
 name: connecso_client
 description: CONNECSO Client, an Android-first consumer VPN application.
 publish_to: none
-version: 0.2.0+1
+version: 0.2.5+5
 
 environment:
   sdk: ">=3.10.0 <4.0.0"
@@ -32,5 +32,8 @@ flutter:
     - assets/connecso_team_logo.png
     - assets/logos/connecso_logo_dark.png
     - assets/logos/connecso_logo_light.png
+    - assets/icons/telegram_about.webp
+    - assets/icons/github_about_dark.webp
+    - assets/icons/github_about_light.webp
     - assets/locations/locations.json
     - assets/maps/world_simplified.geojson

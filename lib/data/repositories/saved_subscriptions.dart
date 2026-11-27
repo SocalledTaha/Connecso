@@ -93,18 +93,18 @@ class SavedSubscription {
     return SavedSubscription(
       id: id,
       name: name.trim(),
-      endpoint: json['endpoint'] as String?,
+      endpoint: json['endpoint'] is String ? json['endpoint'] as String : null,
       quota: quotaJson is Map
           ? QuotaSnapshot.fromJson(Map<String, Object?>.from(quotaJson))
           : QuotaSnapshot.unavailable(),
-      nameCustomized: json['nameCustomized'] as bool? ?? false,
-      pinned: json['pinned'] as bool? ?? false,
+      nameCustomized: json['nameCustomized'] == true,
+      pinned: json['pinned'] == true,
       serverName: _optionalText(json['serverName']),
       accountEmail: _optionalText(json['accountEmail']),
       supportUrl: _optionalText(json['supportUrl']),
       profileUrl: _optionalText(json['profileUrl']),
       announcement: _optionalText(json['announcement']),
-      autoRefreshEnabled: json['autoRefreshEnabled'] as bool? ?? true,
+      autoRefreshEnabled: json['autoRefreshEnabled'] != false,
       refreshIntervalHours: (json['refreshIntervalHours'] as num?)?.round(),
     );
   }
@@ -162,8 +162,14 @@ class SavedSubscriptionsStore {
           // A single damaged row must not hide other saved subscriptions.
         } on TypeError {
           // Ignore only malformed metadata rows.
+        } on ArgumentError {
+          // Ignore only malformed metadata rows.
         }
       }
+      // A valid empty list means the user removed all profiles. A nonempty
+      // payload that yields no valid rows is corruption/schema drift, so let
+      // read() try the last known-good backup instead of hiding every profile.
+      if (decoded.isNotEmpty && subscriptions.isEmpty) return null;
       return subscriptions;
     } on FormatException {
       return null;

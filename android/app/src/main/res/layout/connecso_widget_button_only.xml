@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+        android:background="@drawable/connecso_widget_background"
+    android:padding="4dp">
+    <ImageView
+        android:id="@+id/widget_action"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_gravity="center"
+        android:background="@drawable/connecso_widget_power_idle" android:scaleType="fitCenter" android:padding="11dp" android:src="@drawable/ic_widget_power" />
+</FrameLayout>

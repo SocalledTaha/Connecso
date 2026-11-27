@@ -140,7 +140,11 @@ class VpnNode {
   };
 
   factory VpnNode.fromJson(Map<String, Object?> json) {
-    final protocol = ProxyProtocol.values.byName(json['protocol']! as String);
+    final protocol = _enumValue(
+      ProxyProtocol.values,
+      json['protocol'],
+      ProxyProtocol.unknown,
+    );
     final credentials =
         (json['credentials'] as Map?)?.map(
           (key, value) => MapEntry(key.toString(), value.toString()),
@@ -170,8 +174,10 @@ class VpnNode {
       city: json['city'] as String?,
       latitude: (json['latitude'] as num?)?.toDouble(),
       longitude: (json['longitude'] as num?)?.toDouble(),
-      locationSource: LocationSource.values.byName(
-        json['locationSource'] as String? ?? 'unknown',
+      locationSource: _enumValue(
+        LocationSource.values,
+        json['locationSource'],
+        LocationSource.unknown,
       ),
       locationConfidence: (json['locationConfidence'] as num?)?.toDouble() ?? 0,
       sni: json['sni'] as String?,
@@ -191,7 +197,7 @@ class VpnNode {
       successCount: json['successCount'] as int? ?? 0,
       failureCount: json['failureCount'] as int? ?? 0,
       stabilityScore: (json['stabilityScore'] as num?)?.toDouble() ?? 0,
-      health: NodeHealth.values.byName(json['health'] as String? ?? 'unknown'),
+      health: _enumValue(NodeHealth.values, json['health'], NodeHealth.unknown),
       lastProbe: _date(json['lastProbe']),
       last5Pings: (json['last5Pings'] is List)
           ? (json['last5Pings'] as List)
@@ -204,9 +210,11 @@ class VpnNode {
           ? null
           : Duration(milliseconds: (json['baselinePingMs'] as num).round()),
       consecutiveFailures: json['consecutiveFailures'] as int? ?? 0,
-      runtimeState: RuntimeHealthState.values.byName(
-        json['runtimeState'] as String? ??
+      runtimeState: _enumValue(
+        RuntimeHealthState.values,
+        json['runtimeState'] ??
             ((json['deadForCycle'] as bool? ?? false) ? 'dead' : 'unknown'),
+        RuntimeHealthState.unknown,
       ),
     );
   }
@@ -248,16 +256,37 @@ List<VpnNode> decodeNodes(String source) {
     // Version 1 stored a bare node list. fromJson migrates legacy security fields.
     rows = decoded;
   } else if (decoded is Map) {
-    final version = decoded['schemaVersion'];
     final nodes = decoded['nodes'];
-    if (version != 2 || nodes is! List<Object?>) {
+    if (nodes is! List) {
       throw const FormatException('Unsupported subscription cache schema.');
     }
-    rows = nodes;
+    // Keep reading older/newer envelopes when their node collection is still
+    // present. Individual fields are migrated with safe defaults below.
+    rows = List<Object?>.from(nodes);
   } else {
     throw const FormatException('Subscription cache is not a node list.');
   }
-  return rows
-      .map((row) => VpnNode.fromJson(Map<String, Object?>.from(row! as Map)))
-      .toList(growable: false);
+  final nodes = <VpnNode>[];
+  for (final row in rows) {
+    if (row is! Map) continue;
+    try {
+      nodes.add(VpnNode.fromJson(Map<String, Object?>.from(row)));
+    } on FormatException {
+      // A malformed node must not hide healthy rows in the same cache.
+    } on TypeError {
+      // Skip only rows whose required fields cannot be recovered.
+    } on ArgumentError {
+      // Enum or map fields from a newer schema may not be recognized here.
+    }
+  }
+  return nodes;
+}
+
+T _enumValue<T extends Enum>(Iterable<T> values, Object? raw, T fallback) {
+  if (raw is String) {
+    for (final value in values) {
+      if (value.name == raw) return value;
+    }
+  }
+  return fallback;
 }

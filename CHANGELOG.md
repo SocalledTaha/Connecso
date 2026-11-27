@@ -2,6 +2,14 @@
 
 Release notes for private Android test builds. Each GitHub Actions run attaches this file as a separate artifact whose name carries the same app version, CI build number, and commit as the APK artifact.
 
+## 0.2.5 — Android multi-ABI release
+
+- Refined the destination browser with Favorites, Recent, and country groups, per-node live RTT, and queued single/batch ping handling.
+- Improved wide home-screen widgets with selectable favorite destinations and stable destination-specific connect actions.
+- Routed Speed Test downloads through the active Xray SOCKS dataplane and refreshes This Session from the native tunnel counters after a test.
+- Updated connection, subscription, split-tunneling, settings, localization, theme, and Android integration flows.
+- Published signed Universal, armeabi-v7a, arm64-v8a, and x86_64 APKs.
+
 ## 0.1.3 — Permanent signing migration build
 
 - Release APKs use the permanent CONNECSO RSA-4096 certificate restored from GitHub Actions secrets.

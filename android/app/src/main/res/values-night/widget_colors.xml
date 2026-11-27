@@ -1,0 +1,6 @@
+<resources>
+    <color name="widget_primary_text">#F3FAFC</color>
+    <color name="widget_secondary_text">#A9BBC4</color>
+    <color name="widget_accent">#00D9F5</color>
+    <color name="widget_progress_track">#263B45</color>
+</resources>

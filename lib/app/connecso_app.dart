@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:developer' as developer;
+import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
@@ -24,17 +26,21 @@ import '../domain/services/probe_engine.dart';
 import '../domain/services/smart_selector.dart';
 import '../domain/services/connect_trace.dart';
 import '../data/repositories/subscription_repository.dart';
+import '../data/repositories/subscription_request_identity.dart';
 import '../data/parsers/subscription_parser.dart';
 import '../domain/services/usage_service.dart';
 import '../domain/services/usage_session_lifecycle.dart';
 import '../domain/services/split_tunnel_policy.dart';
 import '../domain/services/structured_logger.dart';
+import '../domain/services/xray_config_builder.dart';
 import '../domain/services/source_country_resolver.dart';
 import '../l10n/app_strings.dart';
 import '../platform/android/android_vpn_adapter.dart';
+import '../platform/android/android_auto_update_service.dart';
 import '../platform/android/background_subscription_refresh.dart';
 import '../platform/android/xray_proxy_core.dart';
 import '../ui/home/home_screen.dart';
+import '../ui/home/destination_country_selector.dart';
 import '../ui/split_tunneling/split_tunneling_screen.dart';
 
 const _debugPerformanceOverlay = bool.fromEnvironment(
@@ -51,8 +57,10 @@ class ConnecsoApp extends StatefulWidget {
 
 class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
   static const _storage = FlutterSecureStorage();
+  static final _navigatorKey = GlobalKey<NavigatorState>();
   final _history = AppDatabase();
   late final AndroidVpnAdapter _vpn = AndroidVpnAdapter();
+  late final AndroidUpdateService _androidUpdates = AndroidUpdateService(_vpn);
   late final SecureSubscriptionCache _cache = SecureSubscriptionCache(_storage);
   late final SavedSubscriptionsStore _savedStore = SavedSubscriptionsStore(
     _storage,
@@ -61,6 +69,7 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
     cache: _cache,
     directFetcher: _vpn.fetchDirectSubscription,
     currentRouteFetcher: _vpn.fetchCurrentRouteSubscription,
+    requestHeadersProvider: SubscriptionRequestIdentity(_storage).headers,
   );
   late final UsageSessionLifecycle _usageSessions = UsageSessionLifecycle(
     beginSession: _history.beginUsageSession,
@@ -97,12 +106,50 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
   final _sourceCountryResolver = const SourceCountryResolver();
   String? _sourceCountryCode;
 
+  DestinationLocation? _destinationLocationFor(VpnNode? node) {
+    if (node == null) return null;
+    final explicitCode = LocationResolver.canonicalCountryCode(
+      node.countryCode,
+    );
+    final explicitNameCode = LocationResolver.canonicalCountryCode(
+      node.country,
+    );
+    final trustedCode = explicitCode.isNotEmpty
+        ? explicitCode
+        : explicitNameCode;
+    if (trustedCode.isNotEmpty) {
+      return LocationResolver.forCountryCode(trustedCode) ??
+          _locations.resolve(node);
+    }
+    return _locations.resolve(node);
+  }
+
   Future<void> _resolveSourceCountry() async {
     final code = await _sourceCountryResolver.resolve();
     if (mounted && code != null) setState(() => _sourceCountryCode = code);
   }
 
-  Future<List<InstalledApplication>> _installedApplications() async {
+  Future<List<InstalledApplication>> _installedApplications() {
+    final cached = _installedApplicationsCache;
+    if (cached != null) return Future.value(cached);
+    final pending = _installedApplicationsLoad;
+    if (pending != null) return pending;
+    late final Future<List<InstalledApplication>> load;
+    load = _loadInstalledApplications()
+        .then((applications) {
+          _installedApplicationsCache = applications;
+          return applications;
+        })
+        .whenComplete(() {
+          if (identical(_installedApplicationsLoad, load)) {
+            _installedApplicationsLoad = null;
+          }
+        });
+    _installedApplicationsLoad = load;
+    return load;
+  }
+
+  Future<List<InstalledApplication>> _loadInstalledApplications() async {
     final applications = await _vpn.installedApplications();
     return applications
         .map(
@@ -116,10 +163,17 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
         .toList(growable: false);
   }
 
+  List<InstalledApplication>? _installedApplicationsCache;
+  Future<List<InstalledApplication>>? _installedApplicationsLoad;
+
   Timer? _statsTimer;
   Timer? _healthTimer;
+  Timer? _quickTileSyncTimer;
+  Timer? _speedTestResultTimer;
   DateTime? _connectedAt;
   bool _healthCheckRunning = false;
+  bool _statsPollRunning = false;
+  int _consecutiveDegradedHealthChecks = 0;
   bool _connectedHealthReady = false;
   int _sessionUploadOffsetBytes = 0;
   int _sessionDownloadOffsetBytes = 0;
@@ -159,6 +213,9 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
   VpnNode? _destinationNode;
   DestinationSelection _destinationSelection =
       const DestinationSelection.auto();
+  Set<String> _favoriteDestinationKeys = {};
+  String? _recentDestinationCountryCode;
+  Future<void> _destinationSelectionQueue = Future<void>.value();
   String? _failure;
   QuotaSnapshot _quota = QuotaSnapshot.unavailable();
   SplitTunnelPolicy _splitPolicy = const SplitTunnelPolicy(
@@ -170,17 +227,31 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
       ? const Locale('fa')
       : const Locale('en');
   ThemeMode _themeMode = ThemeMode.system;
-  // Render Home immediately. Secure-storage/cache restore is asynchronous and
-  // must not replace the first frame with a startup spinner.
-  bool _loading = false;
+  bool _performanceMode = false;
+  bool _speedTestRunning = false;
+  double? _speedTestMbps;
+  String? _speedTestError;
+  String? _lastWidgetSyncKey;
+  bool _autoUpdateEnabled = false;
+  bool _updateUseActiveRoute = true;
+  bool _updateIncludePrerelease = true;
+  bool _updateCheckInFlight = false;
+  String _appVersion = '0.0.0';
+  Timer? _updateCheckTimer;
+  // Keep the initial frame in its loading state until the cached subscriptions
+  // and destinations have been restored, so an empty list is never flashed.
+  bool _loading = true;
   bool _synchronizingTileConnection = false;
   bool _toggleInFlight = false;
+  int _connectionRequestGeneration = 0;
 
   @override
   void initState() {
     super.initState();
     unawaited(_resolveSourceCountry());
     WidgetsBinding.instance.addObserver(this);
+    // DNS leak protection is always enabled; it has no user-facing toggle.
+    _vpn.fakeDnsEnabled = true;
     // Quick Settings runs outside Flutter. MainActivity forwards its result
     // broadcast here, so the home UI updates on the actual state transition
     // instead of polling every few seconds.
@@ -198,18 +269,50 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
       }),
     );
     _restore();
+    unawaited(_loadAndroidAppVersion());
+    _updateCheckTimer = Timer.periodic(const Duration(hours: 6), (_) {
+      if (_autoUpdateEnabled)
+        unawaited(_checkForAndroidUpdates(automatic: true));
+    });
+  }
+
+  Future<void> _loadAndroidAppVersion() async {
+    try {
+      final version = await _androidUpdates.installedVersion();
+      if (mounted && version != _appVersion)
+        setState(() => _appVersion = version);
+    } catch (_) {}
   }
 
   Future<void> _restore() async {
-    final values = await Future.wait([
-      _savedStore.read(),
-      _storage.read(key: 'subscription_nodes_v1'),
-      _storage.read(key: 'subscription_url_v1'),
-      _storage.read(key: 'subscription_quota_v1'),
-      _storage.read(key: 'subscription_active_v1'),
-      _storage.read(key: 'language'),
-      _storage.read(key: 'theme'),
-      _storage.read(key: 'split_tunnel_policy_v1'),
+    final restore = _restoreFromStorage();
+    try {
+      await restore.timeout(const Duration(seconds: 20));
+    } on TimeoutException {
+      _logger.record(
+        category: LogCategory.subscription,
+        severity: LogSeverity.warning,
+        event: 'startup.restore_timed_out',
+      );
+      if (mounted) setState(() => _loading = false);
+      // Secure storage calls cannot be cancelled. Keep listening so a slow
+      // platform response can still restore the saved state when it arrives.
+      unawaited(
+        restore.catchError((Object error) => _recordRestoreFailure(error)),
+      );
+    } catch (error) {
+      _recordRestoreFailure(error);
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _restoreFromStorage() async {
+    final values = await Future.wait<Object?>([
+      _readSavedSubscriptions(),
+      _readStartupValue('subscription_nodes_v1'),
+      _readStartupValue('subscription_url_v1'),
+      _readStartupValue('subscription_quota_v1'),
+      _readStartupValue('subscription_active_v1'),
     ]);
     var subscriptions = values[0] as List<SavedSubscription>;
     var activeId = values[4] as String?;
@@ -227,13 +330,82 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
         ),
       ];
       activeId = 'primary';
-      await _savedStore.write(subscriptions);
-      await _storage.write(key: 'subscription_active_v1', value: activeId);
+      try {
+        await _savedStore
+            .write(subscriptions)
+            .timeout(const Duration(seconds: 10));
+        await _storage
+            .write(key: 'subscription_active_v1', value: activeId)
+            .timeout(const Duration(seconds: 10));
+      } catch (error) {
+        _recordRestoreFailure(error);
+      }
     }
-    if (!subscriptions.any((item) => item.id == activeId)) activeId = null;
-    final nodes = activeId == null
-        ? const <VpnNode>[]
-        : await _subscriptions.cachedNodes(activeId);
+    if (!subscriptions.any((item) => item.id == activeId)) {
+      activeId =
+          subscriptions.where((item) => item.pinned).firstOrNull?.id ??
+          subscriptions.firstOrNull?.id;
+      if (activeId != null) {
+        try {
+          await _storage
+              .write(key: 'subscription_active_v1', value: activeId)
+              .timeout(const Duration(seconds: 10));
+        } catch (error) {
+          _recordRestoreFailure(error);
+        }
+      }
+    }
+    var nodes = const <VpnNode>[];
+    if (activeId != null) {
+      try {
+        nodes = await _subscriptions
+            .cachedNodes(activeId)
+            .timeout(const Duration(seconds: 10));
+      } catch (error) {
+        _logger.record(
+          category: LogCategory.subscription,
+          severity: LogSeverity.warning,
+          event: 'startup.node_cache_read_failed',
+          fields: {'failureType': error.runtimeType.toString()},
+        );
+      }
+    }
+    // Older single-profile builds stored nodes under one global key. If the
+    // profile now has a generated ID, safely migrate that cache only when it
+    // is unambiguous which saved profile owns it.
+    final legacyNodesJson = values[1] as String?;
+    if (nodes.isEmpty &&
+        activeId != null &&
+        subscriptions.length == 1 &&
+        legacyNodesJson?.isNotEmpty == true) {
+      try {
+        final legacyNodes = decodeNodes(legacyNodesJson!);
+        if (legacyNodes.isNotEmpty) {
+          nodes = legacyNodes
+              .map(
+                (node) => VpnNode.fromJson({
+                  ...node.toJson(),
+                  'subscriptionId': activeId,
+                }),
+              )
+              .toList(growable: false);
+          await _cache.replaceNodes(activeId, nodes);
+          _logger.record(
+            category: LogCategory.subscription,
+            severity: LogSeverity.info,
+            event: 'startup.legacy_node_cache_migrated',
+            fields: {'count': nodes.length},
+          );
+        }
+      } catch (error) {
+        _logger.record(
+          category: LogCategory.subscription,
+          severity: LogSeverity.warning,
+          event: 'startup.legacy_node_cache_migration_failed',
+          fields: {'failureType': error.runtimeType.toString()},
+        );
+      }
+    }
     final active = activeId == null
         ? null
         : subscriptions.firstWhere((item) => item.id == activeId);
@@ -247,18 +419,59 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
           ? ConnectionPhase.noProfile
           : ConnectionPhase.disconnected;
       _activeNode = null;
-      if (values[5] is String) {
-        _locale = values[5] == 'fa' ? const Locale('fa') : const Locale('en');
-      }
-      if (values[6] == 'light') {
-        _themeMode = ThemeMode.light;
-      } else if (values[6] == 'dark') {
-        _themeMode = ThemeMode.dark;
-      }
-      _splitPolicy = _readSplitPolicy(values[7]);
       _quota = active?.quota ?? QuotaSnapshot.unavailable();
       _hasSubscriptionUrl = active?.endpoint?.isNotEmpty == true;
+      // Show the decrypted last-known profile and node list before restoring
+      // secondary preferences; their secure-storage reads must not hold the
+      // first usable screen behind a spinner.
       _loading = false;
+    });
+
+    final preferences = await Future.wait<Object?>([
+      _readStartupValue('language'),
+      _readStartupValue('theme'),
+      _readStartupValue('split_tunnel_policy_v1'),
+      _readStartupValue('performance_mode_v1'),
+      _readStartupValue('auto_update_enabled_v1'),
+      _readStartupValue('update_use_active_route_v1'),
+      _readStartupValue('update_include_prerelease_v1'),
+      _readStartupValue('favorite_destination_countries_v1'),
+      _readStartupValue('recent_destination_country_v1'),
+    ]);
+    if (!mounted) return;
+    setState(() {
+      if (preferences[0] is String) {
+        _locale = preferences[0] == 'fa'
+            ? const Locale('fa')
+            : const Locale('en');
+      }
+      if (preferences[1] == 'light') {
+        _themeMode = ThemeMode.light;
+      } else if (preferences[1] == 'dark') {
+        _themeMode = ThemeMode.dark;
+      }
+      _splitPolicy = _readSplitPolicy(preferences[2]);
+      _performanceMode = preferences[3] == 'true';
+      _autoUpdateEnabled = preferences[4] == 'true';
+      _updateUseActiveRoute = preferences[5] != 'false';
+      _updateIncludePrerelease = preferences[6] != 'false';
+      final favoriteValue = preferences[7];
+      if (favoriteValue is String) {
+        try {
+          final decoded = jsonDecode(favoriteValue);
+          if (decoded is List) {
+            _favoriteDestinationKeys = decoded
+                .whereType<String>()
+                // Country codes are case-insensitive; node IDs after the
+                // `node:` prefix are opaque and must retain their exact case.
+                .map((key) => key.startsWith('node:') ? key : key.toUpperCase())
+                .toSet();
+          }
+        } on FormatException {
+          _favoriteDestinationKeys = {};
+        }
+      }
+      _recentDestinationCountryCode = preferences[8] as String?;
     });
     final savedMethod = await _storage.read(key: 'connection_method_v1');
     if (mounted) {
@@ -274,11 +487,16 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
         savedMode == DestinationMode.countryLocked.name &&
         savedCountry != null &&
         savedCountry.isNotEmpty) {
+      final savedNodeId = await _storage.read(key: 'destination_node_v1');
       setState(
-        () =>
-            _destinationSelection = DestinationSelection.country(savedCountry),
+        () => _destinationSelection = DestinationSelection.country(
+          savedCountry,
+          method: _connectionMethod,
+          nodeId: savedNodeId,
+        ),
       );
     }
+    if (_autoUpdateEnabled) unawaited(_checkForAndroidUpdates(automatic: true));
     // Quick-tile verification can perform several network checks. It must
     // restore a real connected session when present, but it should not keep
     // the HomeScreen behind the startup spinner while doing so.
@@ -290,6 +508,63 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
         nodes: nodes,
         revision: revision,
       ),
+    );
+    // Render the last validated node cache immediately, then refresh the
+    // active subscription in the background. This also repopulates the list
+    // on first launch or after a damaged/empty node cache.
+    final activeEndpoint = active?.endpoint;
+    final activeUri = activeEndpoint == null
+        ? null
+        : Uri.tryParse(activeEndpoint);
+    if (active != null &&
+        activeUri != null &&
+        activeUri.scheme == 'https' &&
+        activeUri.host.isNotEmpty &&
+        (active.autoRefreshEnabled || nodes.isEmpty)) {
+      unawaited(
+        _refreshSubscription(
+          activeUri,
+          subscriptionId: active.id,
+          reportErrors: false,
+        ),
+      );
+    }
+  }
+
+  Future<List<SavedSubscription>> _readSavedSubscriptions() async {
+    try {
+      return await _savedStore.read().timeout(const Duration(seconds: 15));
+    } catch (error) {
+      _logger.record(
+        category: LogCategory.subscription,
+        severity: LogSeverity.warning,
+        event: 'startup.subscription_store_read_failed',
+        fields: {'failureType': error.runtimeType.toString()},
+      );
+      return const [];
+    }
+  }
+
+  Future<String?> _readStartupValue(String key) async {
+    try {
+      return await _storage.read(key: key).timeout(const Duration(seconds: 10));
+    } catch (error) {
+      _logger.record(
+        category: LogCategory.subscription,
+        severity: LogSeverity.warning,
+        event: 'startup.preference_read_failed',
+        fields: {'key': key, 'failureType': error.runtimeType.toString()},
+      );
+      return null;
+    }
+  }
+
+  void _recordRestoreFailure(Object error) {
+    _logger.record(
+      category: LogCategory.subscription,
+      severity: LogSeverity.warning,
+      event: 'startup.restore_failed',
+      fields: {'failureType': error.runtimeType.toString()},
     );
   }
 
@@ -308,25 +583,106 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
   Future<VpnNode> _resolveAndConnect(
     Iterable<VpnNode> nodes, {
     VpnNode? current,
+    bool preferLastSuccessfulNode = true,
     Set<String> excludedNodeIds = const {},
     bool reconnect = false,
     SelectionReason? reason,
   }) async {
     final startedAt = DateTime.now();
-    ConnectTrace.emit('timing.resolver_start');
-    final endpoint = await _endpointResolver.resolve(
-      nodes: nodes,
-      selection: _destinationSelection.copyWith(method: _connectionMethod),
-      current: current,
-      excludedNodeIds: excludedNodeIds,
-      reason: reason,
+    final candidateNodes = nodes.toList(growable: false);
+    // Freeze the user's destination for the whole failover transaction. A
+    // retry must never silently switch from a manually selected country to
+    // Auto because another UI state update happened while probing.
+    final requestedSelection = _destinationSelection.copyWith(
+      method: _connectionMethod,
     );
     ConnectTrace.emit(
-      'timing.resolver_ready elapsedMs=${DateTime.now().difference(startedAt).inMilliseconds} node=${endpoint.node.id}',
+      'selection.resolution_start mode=${requestedSelection.mode.name} '
+      'country=${requestedSelection.countryCode ?? 'AUTO'} '
+      'method=${requestedSelection.method?.name ?? 'AUTO'} '
+      'nodes=${candidateNodes.length}',
     );
-    return reconnect
-        ? _connection.reconnect(endpoint, splitTunnelPolicy: _splitPolicy)
-        : _connection.connect(endpoint, splitTunnelPolicy: _splitPolicy);
+    final countryCounts = <String, int>{};
+    for (final node in candidateNodes) {
+      final code = LocationResolver.canonicalCountryCode(
+        '${node.countryCode ?? ''} ${node.country ?? ''} ${node.name}',
+      );
+      countryCounts.update(
+        code.isEmpty ? '??' : code,
+        (value) => value + 1,
+        ifAbsent: () => 1,
+      );
+    }
+    ConnectTrace.emit(
+      'selection.candidate_countries ${countryCounts.entries.map((e) => '${e.key}:${e.value}').join(',')}',
+    );
+    return _connection.connectWithFailover(
+      splitTunnelPolicy: _splitPolicy,
+      reconnect: reconnect,
+      resolve: (excluded) async {
+        ConnectTrace.emit('timing.resolver_start');
+        final resolution = await _endpointResolver.resolveCandidates(
+          nodes: candidateNodes,
+          selection: requestedSelection,
+          preferredCountryCodes: _preferredAutoCountryCodes(candidateNodes),
+          // A manual country switch must not inherit endpoint affinity from
+          // the previous country. That stale affinity can make the resolver
+          // keep returning the old route even though the UI selection changed.
+          current:
+              current ??
+              (preferLastSuccessfulNode ? _lastSuccessfulNode : null),
+          excludedNodeIds: {...excludedNodeIds, ...excluded},
+          reason: reason,
+          lastGoodNodeId: preferLastSuccessfulNode
+              ? _lastSuccessfulNode?.id
+              : null,
+        );
+        ConnectTrace.emit(
+          'timing.resolver_ready elapsedMs=${DateTime.now().difference(startedAt).inMilliseconds} '
+          'candidates=${resolution.endpoints.length} checked=${resolution.checkedNodeIds.length}',
+        );
+        final selectedCountry = requestedSelection.countryCode;
+        if (selectedCountry != null) {
+          final strictlyScoped = resolution.endpoints
+              .where((endpoint) {
+                final actualCountry =
+                    _locations.resolve(endpoint.node)?.countryCode ??
+                    LocationResolver.canonicalCountryCode(
+                      '${endpoint.node.countryCode ?? ''} '
+                      '${endpoint.node.country ?? ''} ${endpoint.node.name}',
+                    );
+                return actualCountry == selectedCountry;
+              })
+              .toList(growable: false);
+          if (strictlyScoped.length != resolution.endpoints.length) {
+            ConnectTrace.emit(
+              'selection.scope_violation selected=$selectedCountry '
+              'returned=${resolution.endpoints.map((e) => e.node.id).join(',')}',
+            );
+          }
+          return EndpointResolution(
+            endpoints: List.unmodifiable(strictlyScoped),
+            checkedNodeIds: resolution.checkedNodeIds,
+          );
+        }
+        return resolution;
+      },
+    );
+  }
+
+  Set<String> _preferredAutoCountryCodes(Iterable<VpnNode> nodes) {
+    final countries = <String>{};
+    for (final node in nodes) {
+      final code = LocationResolver.canonicalCountryCode(
+        '${node.countryCode ?? ''} ${node.country ?? ''} ${node.name}',
+      );
+      if (code.isNotEmpty &&
+          (_favoriteDestinationKeys.contains('node:${node.id}') ||
+              _favoriteDestinationKeys.contains(code))) {
+        countries.add(code);
+      }
+    }
+    return countries;
   }
 
   Future<void> _setConnectionMethod(ConnectionMethod? method) async {
@@ -335,7 +691,10 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
       return;
     }
     final country = _destinationSelection.countryCode;
-    final keepCountry =
+    // Keep the manually chosen country even when the newly selected transport
+    // is unavailable there; clear the transport selection instead of
+    // resetting the destination to Auto.
+    final methodAvailableInCountry =
         country == null ||
         method == null ||
         _nodes.any(
@@ -347,44 +706,126 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
                   ) ==
                   country,
         );
+    final effectiveMethod = methodAvailableInCountry ? method : null;
     setState(() {
-      _connectionMethod = method;
-      if (!keepCountry) {
-        _destinationSelection = const DestinationSelection.auto();
-      }
+      _connectionMethod = effectiveMethod;
     });
-    if (method == null) {
+    if (effectiveMethod == null) {
       await _storage.delete(key: 'connection_method_v1');
     } else {
-      await _storage.write(key: 'connection_method_v1', value: method.name);
-    }
-    if (!keepCountry) {
       await _storage.write(
-        key: 'destination_mode_v1',
-        value: DestinationMode.auto.name,
+        key: 'connection_method_v1',
+        value: effectiveMethod.name,
       );
-      await _storage.delete(key: 'destination_country_v1');
     }
   }
 
-  Future<void> _setDestinationSelection(DestinationSelection selection) async {
-    setState(() => _destinationSelection = selection);
+  Future<void> _setDestinationSelection(DestinationSelection selection) {
+    final operation = _destinationSelectionQueue.then(
+      (_) => _applyDestinationSelection(selection),
+    );
+    _destinationSelectionQueue = operation.catchError((Object _) {});
+    return operation;
+  }
+
+  Future<void> setDestinationFavorite(
+    String destinationKey,
+    bool favorite,
+  ) async {
+    final key = destinationKey.startsWith('node:')
+        ? destinationKey
+        : destinationKey.toUpperCase();
+    final next = {..._favoriteDestinationKeys};
+    if (favorite) {
+      next.add(key);
+    } else {
+      next.remove(key);
+    }
+    if (mounted) setState(() => _favoriteDestinationKeys = next);
+    await _storage.write(
+      key: 'favorite_destination_countries_v1',
+      value: jsonEncode(next.toList()..sort()),
+    );
+  }
+
+  Future<void> _applyDestinationSelection(
+    DestinationSelection selection,
+  ) async {
+    final previousCountry = _destinationSelection.countryCode;
+    final previousNodeId = _destinationSelection.nodeId;
+    final previousMethod = _destinationSelection.method ?? _connectionMethod;
+    // A country-only selection is also a request to choose among that
+    // country's available transports. Keep a method only when the user picked
+    // a specific server/method explicitly; stale global method preferences
+    // must not force the previous route (or DIRECT/WARP fallback) on it.
+    var nextMethod = selection.nodeId != null || selection.method != null
+        ? selection.method
+        : null;
+    final selectedCountry = selection.countryCode;
+    if (selectedCountry != null && nextMethod != null) {
+      final hasMethodInCountry = _nodes.any((node) {
+        if (!node.enabled || !nextMethod!.matches(node)) return false;
+        final country =
+            _locations.resolve(node)?.countryCode ??
+            LocationResolver.canonicalCountryCode(
+              '${node.countryCode ?? ''} ${node.country ?? ''} ${node.name}',
+            );
+        return country == selectedCountry;
+      });
+      // A globally selected transport may not exist in the newly selected
+      // country. Fall back to automatic transport selection immediately so
+      // the first connection attempt can use that country's available nodes.
+      if (!hasMethodInCountry) nextMethod = null;
+    }
+    setState(() {
+      _destinationSelection = selection.copyWith(method: nextMethod);
+      _connectionMethod = nextMethod;
+    });
+    ConnectTrace.emit(
+      'selection.changed mode=${selection.mode.name} '
+      'country=${selection.countryCode ?? 'AUTO'} '
+      'method=${nextMethod?.name ?? 'AUTO'}',
+    );
+    if (nextMethod == null && selectedCountry != null) {
+      await _storage.delete(key: 'connection_method_v1');
+    }
     await _storage.write(
       key: 'destination_mode_v1',
       value: selection.mode.name,
     );
     if (selection.countryCode == null) {
       await _storage.delete(key: 'destination_country_v1');
+      await _storage.delete(key: 'destination_node_v1');
     } else {
       await _storage.write(
         key: 'destination_country_v1',
         value: selection.countryCode,
       );
+      if (mounted) {
+        setState(() => _recentDestinationCountryCode = selection.countryCode);
+      }
+      await _storage.write(
+        key: 'recent_destination_country_v1',
+        value: selection.countryCode,
+      );
+      if (selection.nodeId == null) {
+        await _storage.delete(key: 'destination_node_v1');
+      } else {
+        await _storage.write(
+          key: 'destination_node_v1',
+          value: selection.nodeId,
+        );
+      }
     }
     // A country change while connected enters the same full reconnect
     // pipeline as Auto mode after restricting the endpoint pool.
-    if (selection.countryCode != null &&
-        _phase == ConnectionPhase.connected &&
+    final tunnelWasConnected =
+        _phase == ConnectionPhase.connected ||
+        _connection.status.phase == ConnectionPhase.connected;
+    if ((selection.countryCode != previousCountry ||
+            selection.nodeId != previousNodeId ||
+            nextMethod != previousMethod) &&
+        tunnelWasConnected &&
         _nodes.isNotEmpty) {
       // A manual destination change rebuilds the same full VPN pipeline as a
       // fresh Auto connection. Stop observers tied to the previous TUN/core
@@ -393,12 +834,49 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
       _manualPingQueued = false;
       _statsTimer?.cancel();
       _healthTimer?.cancel();
+      setState(() {
+        _phase = ConnectionPhase.reconnecting;
+        _failure = null;
+      });
+      ConnectTrace.emit(
+        'destination.switch_start from=${previousCountry ?? 'AUTO'} '
+        'to=${selection.countryCode ?? 'AUTO'}',
+      );
       try {
+        // Fully stop the old VPN/core before resolving the new route. The
+        // reconnect flag can keep the existing Android VPN session alive,
+        // which leaves the old country active on some devices.
+        setState(() {
+          _phase = ConnectionPhase.disconnecting;
+          _activeNode = null;
+          _destinationNode = null;
+        });
+        await _connection.disconnect();
+        if (!mounted) return;
+        setState(() {
+          _phase = ConnectionPhase.reconnecting;
+        });
         final selected = await _resolveAndConnect(
           _destinationPool,
-          current: _activeNode,
-          reconnect: true,
+          // A previous country's healthy endpoint must never bias resolution
+          // for a newly selected destination.
+          current: null,
+          preferLastSuccessfulNode: false,
+          reconnect: false,
         );
+        final actualCountry =
+            _locations.resolve(selected)?.countryCode ??
+            LocationResolver.canonicalCountryCode(
+              '${selected.countryCode ?? ''} ${selected.country ?? ''} ${selected.name}',
+            );
+        if (selection.countryCode != null &&
+            actualCountry != selection.countryCode) {
+          await _connection.disconnect();
+          throw StateError(
+            'Selected route country $actualCountry does not match '
+            '${selection.countryCode}.',
+          );
+        }
         if (mounted) {
           setState(() {
             _activeNode = selected;
@@ -406,15 +884,33 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
             _phase = ConnectionPhase.connected;
             _failure = null;
           });
+          ConnectTrace.emit(
+            'destination.switch_complete country=${actualCountry.isEmpty ? 'AUTO' : actualCountry} '
+            'node=${selected.id}',
+          );
           _connectedAt = DateTime.now();
           _startStatsPolling(newSession: true);
           _startHealthMonitoring();
           unawaited(_refreshConnectionPing());
         }
       } catch (error) {
+        // Do not leave the previous route running if rebuilding the selected
+        // country fails partway through.
+        try {
+          await _connection.disconnect();
+        } catch (_) {}
         if (mounted) {
-          setState(() => _failure = _humanError(error));
+          setState(() {
+            _phase = ConnectionPhase.disconnected;
+            _activeNode = null;
+            _destinationNode = null;
+            _failure = _humanError(error);
+          });
         }
+        ConnectTrace.emit(
+          'destination.switch_failed country=${selection.countryCode ?? 'AUTO'} '
+          'failureType=${error.runtimeType}',
+        );
       }
     }
   }
@@ -426,7 +922,24 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
     required List<VpnNode> nodes,
     required int revision,
   }) async {
-    final tileNode = await _findVerifiedTileNode(subscriptions);
+    final tileState = await _vpn.quickTileConnection();
+    final nodeId = tileState['nodeId'] as String?;
+    final sessionPresent =
+        tileState['active'] == true || tileState['serviceRunning'] == true;
+    VpnNode? tileNode;
+    if (sessionPresent && nodeId != null) {
+      tileNode = nodes.where((node) => node.id == nodeId).firstOrNull;
+      for (final profile in subscriptions) {
+        if (tileNode != null) break;
+        final cached = await _subscriptions.cachedNodes(profile.id);
+        tileNode = cached.where((node) => node.id == nodeId).firstOrNull;
+        if (tileNode != null) break;
+      }
+      // The native service writes `active` only after Xray and the TUN engine
+      // have started successfully. Do not gate session restoration on an
+      // Internet probe here: a temporary timeout after returning from the
+      // background must not make a still-running tunnel look disconnected.
+    }
     if (!mounted ||
         _activeSubscriptionId != activeId ||
         (_phase != ConnectionPhase.disconnected &&
@@ -460,40 +973,23 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
     }
   }
 
-  Future<VpnNode?> _findVerifiedTileNode(
-    List<SavedSubscription> subscriptions,
-  ) async {
-    final nodeId = await _vpn.activeQuickTileNodeId().catchError(
-      (Object _) => null,
-    );
-    if (nodeId == null) return null;
-    for (final profile in subscriptions) {
-      final nodes = await _subscriptions.cachedNodes(profile.id);
-      for (final node in nodes) {
-        if (node.id == nodeId && await _verifyTunnelWithRetry()) return node;
-      }
-    }
-    return null;
-  }
-
-  Future<bool> _verifyTunnelWithRetry() async {
-    for (var attempt = 0; attempt < 4; attempt++) {
-      if (await _vpn.verifyUsableConnectivity().catchError(
-        (Object _) => false,
-      )) {
-        return true;
-      }
-      if (attempt < 3) {
-        await Future<void>.delayed(const Duration(milliseconds: 500));
-      }
-    }
-    return false;
-  }
-
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed && !_loading) {
       unawaited(_synchronizeQuickTileConnection());
+      _quickTileSyncTimer?.cancel();
+      _quickTileSyncTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+        if (mounted && !_loading) {
+          unawaited(_synchronizeQuickTileConnection());
+        }
+      });
+      if (_autoUpdateEnabled) {
+        unawaited(_checkForAndroidUpdates(automatic: true));
+      }
+    } else if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      _quickTileSyncTimer?.cancel();
+      _quickTileSyncTimer = null;
     }
   }
 
@@ -511,7 +1007,18 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
       final tileNodeId = tileState['nodeId'] as String?;
       VpnNode? tileNode;
       if ((tileActive || serviceRunning) && tileNodeId != null) {
+        tileNode =
+            <VpnNode?>[
+                  _activeNode,
+                  _lastSuccessfulNode,
+                  _destinationNode,
+                  ..._nodes,
+                ]
+                .whereType<VpnNode>()
+                .where((node) => node.id == tileNodeId)
+                .firstOrNull;
         for (final profile in subscriptions) {
+          if (tileNode != null) break;
           final cached = await _subscriptions.cachedNodes(profile.id);
           final matches = cached.where((node) => node.id == tileNodeId);
           if (matches.isNotEmpty) {
@@ -521,17 +1028,14 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
         }
       }
       if (!mounted) return;
-      // After lock/unlock the Android service can remain alive while the
-      // persisted Quick Tile flag is briefly stale. Confirm the native
-      // dataplane before restoring the Flutter state in that case.
-      final nativeSessionUsable =
-          tileNode != null &&
-          (tileActive ||
-              (serviceRunning &&
-                  await _verifyTunnelWithRetry().catchError(
-                    (Object _) => false,
-                  )));
-      if (nativeSessionUsable &&
+      // `active` is persisted by the VPN service only after successful native
+      // dataplane startup, and `serviceRunning` confirms the tunnel-owning
+      // service survived while Flutter was backgrounded. An HTTP reachability
+      // check is intentionally not part of UI state restoration: transient
+      // network stalls must not erase a live session from the screen.
+      final nativeSessionActive =
+          tileNode != null && (tileActive || serviceRunning);
+      if (nativeSessionActive &&
           (_activeNode?.id != tileNode!.id ||
               _phase != ConnectionPhase.connected)) {
         setState(() {
@@ -542,7 +1046,10 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
         _connection.restoreConnectedSession();
         _startStatsPolling(newSession: true);
         _startHealthMonitoring();
-      } else if (tileNode == null && _phase == ConnectionPhase.connected) {
+      } else if (tileNode == null &&
+          !tileActive &&
+          !serviceRunning &&
+          _phase == ConnectionPhase.connected) {
         _statsTimer?.cancel();
         _healthTimer?.cancel();
         await _endUsageSession();
@@ -581,12 +1088,11 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
   }
 
   Future<void> _saveSplitPolicy(SplitTunnelPolicy policy) async {
+    if (mounted) setState(() => _splitPolicy = policy);
     await _storage.write(
       key: 'split_tunnel_policy_v1',
       value: jsonEncode(policy.toJson()),
     );
-    if (!mounted) return;
-    setState(() => _splitPolicy = policy);
   }
 
   Future<void> importSubscription(String source) async {
@@ -632,7 +1138,10 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
     setState(() {
       _savedSubscriptions = subscriptions;
       _activeSubscriptionId = id;
-      if (!connected) _nodes = imported;
+      // Update the selected profile's destination catalog immediately even
+      // while an older tunnel is still connected. The active tunnel remains
+      // represented by _activeNode until the user reconnects or switches.
+      _nodes = imported;
       _quota = QuotaSnapshot.unavailable();
       _hasSubscriptionUrl = false;
       if (!connected) {
@@ -653,7 +1162,11 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
     String? newProfileName,
     bool reportErrors = true,
   }) async {
-    if (endpoint == null || endpoint.scheme != 'https') return;
+    if (endpoint == null ||
+        endpoint.scheme != 'https' ||
+        endpoint.host.isEmpty) {
+      throw StateError('This subscription does not have a valid HTTPS link.');
+    }
     if (_refreshingSubscriptionIds.contains(subscriptionId)) {
       if (reportErrors) {
         throw StateError('This subscription is already being refreshed.');
@@ -735,10 +1248,10 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
         nameCustomized: previous?.nameCustomized ?? false,
         pinned: previous?.pinned ?? false,
         serverName: title ?? previous?.serverName,
-        accountEmail: result.accountEmail ?? previous?.accountEmail,
-        supportUrl: result.supportUrl ?? previous?.supportUrl,
-        profileUrl: result.profileUrl ?? previous?.profileUrl,
-        announcement: result.announcement ?? previous?.announcement,
+        accountEmail: result.accountEmail,
+        supportUrl: result.supportUrl,
+        profileUrl: result.profileUrl,
+        announcement: result.announcement,
       );
       final subscriptions = [..._savedSubscriptions];
       if (existingIndex < 0) {
@@ -758,20 +1271,17 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
         _activeSubscriptionId = subscriptionId;
       }
       final selected = _activeSubscriptionId == subscriptionId;
-      final connectedToThisProfile =
-          _phase == ConnectionPhase.connected &&
-          _activeNode?.subscriptionId == subscriptionId;
-      final canReplaceNodeList =
-          _phase != ConnectionPhase.connected || connectedToThisProfile;
+      final isConnected = _phase == ConnectionPhase.connected;
       setState(() {
         _savedSubscriptions = subscriptions;
         if (selected) {
           _quota = result.quota;
           _hasSubscriptionUrl = true;
-        }
-        if (selected && canReplaceNodeList) {
+          // Destination browsing follows the selected subscription even if
+          // an older profile's tunnel is still active. Keep that live route
+          // untouched until the user explicitly reconnects.
           _nodes = result.nodes;
-          if (_phase != ConnectionPhase.connected) {
+          if (!isConnected) {
             _phase = result.nodes.isEmpty
                 ? ConnectionPhase.noProfile
                 : ConnectionPhase.disconnected;
@@ -786,7 +1296,7 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
         event: 'subscription.refreshed',
         fields: {'count': result.nodes.length},
       );
-      if (selected && canReplaceNodeList) {
+      if (selected && !isConnected) {
         unawaited(
           _probeNodes(
             result.nodes,
@@ -1147,6 +1657,202 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
     }
   }
 
+  /// Use the same CoreNodeProbe pipeline as the live ping below Connect.
+  Future<void> _destinationPingQueue = Future<void>.value();
+  int _destinationPingGeneration = 0;
+
+  Future<void> _cancelDestinationPings() async {
+    _destinationPingGeneration++;
+    await _vpn.cancelDestinationPings();
+  }
+
+  Future<Map<String, Duration?>> _pingDestinations(
+    List<VpnNode> requestedNodes, {
+    DestinationPingProgress? onProgress,
+  }) {
+    final generation = _destinationPingGeneration;
+    final operation = _destinationPingQueue.then((_) async {
+      if (generation != _destinationPingGeneration) {
+        return {for (final node in requestedNodes) node.id: null};
+      }
+      final liveResults = <String, Duration?>{};
+      _vpn.setDestinationPingProgressHandler((nodeId, latency) {
+        // A later timeout/failed retry must never erase a warm RTT that was
+        // already delivered from native progress for this same destination.
+        if (latency != null) {
+          liveResults[nodeId] = latency;
+          _storeDestinationWarmRtt(nodeId, latency);
+        }
+        if (latency != null || liveResults[nodeId] == null) {
+          onProgress?.call(nodeId, latency);
+        }
+      });
+      try {
+        return await _runDestinationPings(
+          requestedNodes,
+          liveResults: liveResults,
+          generation: generation,
+        );
+      } finally {
+        _vpn.setDestinationPingProgressHandler(null);
+      }
+    });
+    _destinationPingQueue = operation.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace __) {},
+    );
+    return operation;
+  }
+
+  void _storeDestinationWarmRtt(String nodeId, Duration latency) {
+    if (latency.inMilliseconds <= 0) return;
+    final index = _nodes.indexWhere((node) => node.id == nodeId);
+    if (index < 0) return;
+    final node = _nodes[index];
+    final now = DateTime.now().toUtc();
+    final observations = node.successCount + node.failureCount;
+    final recentPings = [...node.last5Pings, latency.inMilliseconds];
+    if (recentPings.length > 5) {
+      recentPings.removeRange(0, recentPings.length - 5);
+    }
+    final updated = VpnNode.fromJson({
+      ...node.toJson(),
+      'latencyMs': latency.inMilliseconds,
+      'lastProbe': now.toIso8601String(),
+      'lastSuccess': now.toIso8601String(),
+      'successCount': node.successCount + 1,
+      'stabilityScore':
+          ((node.stabilityScore * observations) + 1) / (observations + 1),
+      'health': latency <= const Duration(milliseconds: 1500)
+          ? NodeHealth.healthy.name
+          : NodeHealth.degraded.name,
+      'runtimeState': RuntimeHealthState.healthy.name,
+      'last5Pings': recentPings,
+    });
+    final updatedNodes = [..._nodes]..[index] = updated;
+    if (mounted) setState(() => _nodes = updatedNodes);
+    unawaited(
+      _cache
+          .replaceNodes(
+            node.subscriptionId,
+            updatedNodes
+                .where((item) => item.subscriptionId == node.subscriptionId)
+                .toList(growable: false),
+          )
+          .catchError(_logPersistenceFailure),
+    );
+  }
+
+  Future<Map<String, Duration?>> _runDestinationPings(
+    List<VpnNode> requestedNodes, {
+    required Map<String, Duration?> liveResults,
+    required int generation,
+  }) async {
+    final candidates = <String, VpnNode>{
+      for (final node in requestedNodes)
+        if (node.enabled) node.id: node,
+    }.values.toList(growable: false);
+    if (candidates.isEmpty) return const {};
+    final results = <String, Duration?>{};
+    final sweepClock = Stopwatch()..start();
+    Future<Map<String, Duration?>> pingBatch(
+      List<VpnNode> batch,
+      int worker,
+    ) async {
+      if (batch.isEmpty || generation != _destinationPingGeneration) {
+        return const {};
+      }
+      try {
+        return await _vpn
+            .pingDestinations(batch, worker: worker)
+            .timeout(const Duration(seconds: 45));
+      } on TimeoutException {
+        await _vpn.cancelDestinationPings();
+        _logger.record(
+          category: LogCategory.recovery,
+          severity: LogSeverity.warning,
+          event: 'destination.rtt_batch_timed_out',
+          fields: {'nodeCount': batch.length, 'worker': worker},
+        );
+        return {for (final node in batch) node.id: null};
+      } on Object catch (error) {
+        _logger.record(
+          category: LogCategory.recovery,
+          severity: LogSeverity.warning,
+          event: 'destination.rtt_batch_failed',
+          fields: {
+            'failureType': error.runtimeType.toString(),
+            'nodeCount': batch.length,
+            'worker': worker,
+          },
+        );
+        return {for (final node in batch) node.id: null};
+      }
+    }
+
+    // Process waves in visible list order. Each wave keeps the previous fast
+    // two-worker setup; results still arrive per node as its RTT completes.
+    final retryNodes = <VpnNode>[];
+    for (var index = 0; index < candidates.length; index += 20) {
+      if (generation != _destinationPingGeneration) break;
+      final batch = candidates.skip(index).take(20).toList(growable: false);
+      final firstHalf = batch.take(10).toList(growable: false);
+      final secondHalf = batch.skip(10).take(10).toList(growable: false);
+      final waveResults = await Future.wait([
+        pingBatch(firstHalf, 0),
+        if (secondHalf.isNotEmpty) pingBatch(secondHalf, 1),
+      ]);
+      final completed = <String, Duration?>{
+        for (final result in waveResults) ...result,
+      };
+      if (generation != _destinationPingGeneration) break;
+      for (final node in batch) {
+        final measured = completed[node.id];
+        final warmRtt = liveResults[node.id] ?? measured;
+        results[node.id] = warmRtt;
+        if (warmRtt == null) retryNodes.add(node);
+      }
+    }
+
+    // Retry only misses once after the main sweep, in groups. This avoids
+    // stalling the first-pass queue behind a single unavailable endpoint.
+    for (var index = 0; index < retryNodes.length; index += 20) {
+      if (generation != _destinationPingGeneration) break;
+      final batch = retryNodes.skip(index).take(20).toList(growable: false);
+      final firstHalf = batch.take(10).toList(growable: false);
+      final secondHalf = batch.skip(10).take(10).toList(growable: false);
+      final waveResults = await Future.wait([
+        pingBatch(firstHalf, 0),
+        if (secondHalf.isNotEmpty) pingBatch(secondHalf, 1),
+      ]);
+      final completed = <String, Duration?>{
+        for (final result in waveResults) ...result,
+      };
+      for (final node in batch) {
+        final measured = liveResults[node.id] ?? completed[node.id];
+        if (measured != null) results[node.id] = measured;
+      }
+    }
+    final finalResults = {
+      for (final node in candidates)
+        node.id: liveResults[node.id] ?? results[node.id],
+    };
+    _logger.record(
+      category: LogCategory.probe,
+      severity: LogSeverity.info,
+      event: 'destination.rtt_sweep_completed',
+      fields: {
+        'requestedCount': candidates.length,
+        'successCount': finalResults.values.whereType<Duration>().length,
+        'retryCount': retryNodes.length,
+        'elapsedMs': sweepClock.elapsedMilliseconds,
+        'workerBatchSize': 10,
+        'parallelWorkers': 2,
+      },
+    );
+    return finalResults;
+  }
+
   VpnNode _nodeWithProbeResult(VpnNode node, ProbeResult result) {
     final observations = node.successCount + node.failureCount;
     final reachable = result.reachable;
@@ -1245,8 +1951,8 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
       _activeSubscriptionId = id;
       _quota = profile.quota;
       _hasSubscriptionUrl = profile.endpoint?.isNotEmpty == true;
+      _nodes = nodes;
       if (!connected) {
-        _nodes = nodes;
         _phase = nodes.isEmpty
             ? ConnectionPhase.noProfile
             : ConnectionPhase.disconnected;
@@ -1466,9 +2172,11 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
       });
     }
     _statsTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
+      if (_statsPollRunning) return;
+      _statsPollRunning = true;
       try {
         final stats = await _vpn.readStats();
-        if (!mounted) return;
+        if (!mounted || _phase != ConnectionPhase.connected) return;
         _lastStats = stats;
         setState(() {
           _sessionUploadBytes = _sessionUploadOffsetBytes + stats.uploadBytes;
@@ -1481,6 +2189,8 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
         }
       } catch (_) {
         // Keep the last known value while Android temporarily has no stats.
+      } finally {
+        _statsPollRunning = false;
       }
     });
   }
@@ -1553,6 +2263,7 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
 
   void _startHealthMonitoring() {
     _healthTimer?.cancel();
+    _consecutiveDegradedHealthChecks = 0;
     _connectedAt ??= DateTime.now();
     _healthTimer = Timer.periodic(
       _connectedAt != null &&
@@ -1602,6 +2313,10 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
                 .toList(growable: false);
           });
         }
+        _consecutiveDegradedHealthChecks =
+            state == RuntimeHealthState.nodeSpecificDegraded
+            ? _consecutiveDegradedHealthChecks + 1
+            : 0;
         if (state == RuntimeHealthState.nodeSpecificDegraded) {
           final measured = updatedPeers
               .where(
@@ -1616,13 +2331,21 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
                 (best, value) => best == null || value < best ? value : best,
               );
           final alternative = _selector.select(measured);
-          if (alternative != null &&
+          // A single delayed ping is not enough evidence to move a live
+          // tunnel. Require sustained degradation across several monitoring
+          // cycles before attempting an automatic failover.
+          if (_consecutiveDegradedHealthChecks >= 3 &&
+              alternative != null &&
               _selector.runtimeScore(alternative, bestLatency) >
                   _selector.runtimeScore(stateful, bestLatency) * 1.12) {
             await _switchFromRuntimeDegradation(active);
             return;
           }
         }
+      } else {
+        // An unsuccessful probe is advisory only. Do not let it accumulate
+        // toward a runtime failover decision.
+        _consecutiveDegradedHealthChecks = 0;
       }
       final usable = await _vpn.verifyUsableConnectivity().catchError(
         (_) => false,
@@ -1645,6 +2368,19 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
         }
       }
 
+      // The connectivity probe can fail while the native Xray/TUN dataplane
+      // is still alive. A stats response comes directly from the VPN service
+      // and distinguishes a bad health-check sample from a stopped tunnel.
+      if (await _nativeDataplaneRunning()) {
+        _logger.record(
+          category: LogCategory.probe,
+          severity: LogSeverity.warning,
+          event: 'connection.health_probe_failed_dataplane_alive',
+          fields: {'nodeId': active.id},
+        );
+        return;
+      }
+
       _sessionUploadOffsetBytes += _lastStats?.uploadBytes ?? 0;
       _sessionDownloadOffsetBytes += _lastStats?.downloadBytes ?? 0;
       _lastStats = null;
@@ -1665,6 +2401,19 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
       _connectedAt = DateTime.now();
       unawaited(_recordConnection(replacement, connected: true));
     } catch (error) {
+      if (await _nativeDataplaneRunning() && mounted) {
+        setState(() {
+          _phase = ConnectionPhase.connected;
+          _failure = null;
+        });
+        _logger.record(
+          category: LogCategory.recovery,
+          severity: LogSeverity.warning,
+          event: 'connection.recovery_deferred_dataplane_alive',
+          fields: {'failureType': error.runtimeType.toString()},
+        );
+        return;
+      }
       await _endUsageSession();
       if (!mounted) return;
       _statsTimer?.cancel();
@@ -1683,7 +2432,17 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
     }
   }
 
+  Future<bool> _nativeDataplaneRunning() async {
+    try {
+      await _vpn.readStats();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<void> _switchFromRuntimeDegradation(VpnNode active) async {
+    _consecutiveDegradedHealthChecks = 0;
     _sessionUploadOffsetBytes += _lastStats?.uploadBytes ?? 0;
     _sessionDownloadOffsetBytes += _lastStats?.downloadBytes ?? 0;
     _lastStats = null;
@@ -1706,21 +2465,64 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
   }
 
   Future<void> toggleConnection() async {
-    if (_toggleInFlight) return;
+    if (_toggleInFlight) {
+      if ({
+        ConnectionPhase.preparing,
+        ConnectionPhase.connecting,
+        ConnectionPhase.verifying,
+        ConnectionPhase.reconnecting,
+      }.contains(_phase)) {
+        _connectionRequestGeneration++;
+        await _connection.cancelConnect();
+        if (mounted) {
+          setState(() {
+            _phase = ConnectionPhase.disconnected;
+            _activeNode = null;
+            _destinationNode = null;
+            _failure = null;
+          });
+        }
+      }
+      return;
+    }
     _toggleInFlight = true;
+    final requestGeneration = ++_connectionRequestGeneration;
     try {
-      await _toggleConnectionInternal();
+      await _toggleConnectionInternal(requestGeneration);
     } finally {
       _toggleInFlight = false;
     }
   }
 
-  Future<void> _toggleConnectionInternal() async {
+  Future<void> _toggleConnectionInternal(int requestGeneration) async {
     final tapStartedAt = DateTime.now();
     ConnectTrace.emit('timing.connect_tap phase=${_phase.name}');
     void timing(String event) => ConnectTrace.emit(
       'timing.$event elapsedMs=${DateTime.now().difference(tapStartedAt).inMilliseconds}',
     );
+    if (requestGeneration != _connectionRequestGeneration) return;
+    final transitionInProgress = {
+      ConnectionPhase.preparing,
+      ConnectionPhase.connecting,
+      ConnectionPhase.verifying,
+      ConnectionPhase.reconnecting,
+      ConnectionPhase.disconnecting,
+    }.contains(_phase);
+    if (!transitionInProgress) {
+      // The widget and notification can change the native VPN state while
+      // this screen is open. Reconcile before interpreting this tap so the
+      // main button acts on the real tunnel state instead of stale UI state.
+      try {
+        await _synchronizeQuickTileConnection();
+      } catch (error) {
+        // A transient native state-read failure must not make the primary
+        // connect control inert; its normal start/stop path remains available.
+        ConnectTrace.emit(
+          'native_state_reconcile_failed type=${error.runtimeType}',
+        );
+      }
+      timing('native_state_reconciled');
+    }
     if (_phase == ConnectionPhase.connecting ||
         _phase == ConnectionPhase.preparing ||
         _phase == ConnectionPhase.verifying ||
@@ -1807,17 +2609,50 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
     developer.log('connect_request_received', name: 'CONNECSO_CONNECT_TRACE');
     final connectionStartedAt = DateTime.now();
     try {
-      final selected = await _resolveAndConnect(
-        _destinationPool,
-        current: _activeNode ?? _lastSuccessfulNode,
-      );
+      VpnNode? selected;
+      Object? lastAttemptError;
+      for (var retry = 0; retry < 3; retry++) {
+        if (requestGeneration != _connectionRequestGeneration) {
+          throw const ConnectionCancelled();
+        }
+        if (retry > 0 && mounted) {
+          setState(() {
+            _phase = ConnectionPhase.preparing;
+            _failure = null;
+          });
+          ConnectTrace.emit('automatic_connect_retry attempt=${retry + 1}/3');
+        }
+        try {
+          selected = await _resolveAndConnect(
+            _destinationPool,
+            // Reuse a known-good endpoint only while the destination scope is
+            // unchanged. Country/method changes need a fresh scoped resolution.
+            current:
+                _activeNode?.id == _lastSuccessfulNode?.id &&
+                    _destinationNode?.id == _activeNode?.id
+                ? _activeNode
+                : null,
+          );
+          break;
+        } catch (error) {
+          lastAttemptError = error;
+          if (error is ConnectionCancelled ||
+              requestGeneration != _connectionRequestGeneration ||
+              retry == 2) {
+            rethrow;
+          }
+        }
+      }
+      if (selected == null)
+        throw lastAttemptError ?? StateError('Connect failed.');
+      final connectedNode = selected;
       if (!mounted) return;
       setState(() {
-        _activeNode = selected;
-        _lastSuccessfulNode = selected;
+        _activeNode = connectedNode;
+        _lastSuccessfulNode = connectedNode;
         _nodes = [
           for (final node in _nodes)
-            if (node.id == selected.id) selected else node,
+            if (node.id == connectedNode.id) connectedNode else node,
         ];
         _phase = ConnectionPhase.connected;
         _connectedHealthReady = false;
@@ -1827,10 +2662,14 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
         name: 'CONNECSO_CONNECT_TRACE',
       );
       _connectedAt = DateTime.now();
-      unawaited(_cache.replaceNodes(selected.subscriptionId, _nodes));
+      try {
+        await _cache.replaceNodes(connectedNode.subscriptionId, _nodes);
+      } catch (error) {
+        _logPersistenceFailure(error);
+      }
       unawaited(
         _recordConnection(
-          selected,
+          connectedNode,
           connected: true,
           duration: DateTime.now().difference(connectionStartedAt),
         ),
@@ -1842,6 +2681,10 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
       // the Connected card consistent with a manual refresh.
       unawaited(_refreshConnectionPing());
     } catch (error) {
+      ConnectTrace.emit(
+        'connection_pipeline_failed type=${error.runtimeType} '
+        'detail=${error is CoreException ? error.message.replaceAll(RegExp(r'\s+'), ' ') : error.runtimeType}',
+      );
       if (!mounted) return;
       if (error is ConnectionCancelled) {
         setState(() {
@@ -1915,32 +2758,647 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
     );
   }
 
+  Future<void> setPerformanceMode(bool enabled) async {
+    if (_performanceMode == enabled) return;
+    setState(() => _performanceMode = enabled);
+    await _storage.write(
+      key: 'performance_mode_v1',
+      value: enabled ? 'true' : 'false',
+    );
+  }
+
+  Future<void> _runSpeedTest() async {
+    if (_speedTestRunning || _phase != ConnectionPhase.connected) return;
+    setState(() {
+      _speedTestRunning = true;
+      _speedTestMbps = null;
+      _speedTestError = null;
+    });
+    try {
+      final result = await _vpn.runSpeedTest();
+      final value = result['megabitsPerSecond'];
+      if (!mounted) return;
+      setState(() => _speedTestMbps = value is num ? value.toDouble() : null);
+      // Read the authoritative Xray/TUN counters immediately after the test.
+      // Do not add the speed-test byte count to session usage: only the tunnel
+      // dataplane counters determine the displayed and persisted totals.
+      try {
+        final stats = await _vpn.readStats();
+        if (mounted && _phase == ConnectionPhase.connected) {
+          _lastStats = stats;
+          setState(() {
+            _sessionUploadBytes = _sessionUploadOffsetBytes + stats.uploadBytes;
+            _sessionDownloadBytes =
+                _sessionDownloadOffsetBytes + stats.downloadBytes;
+          });
+        }
+      } catch (_) {
+        // The regular session poll will refresh once the native counters respond.
+      }
+      _speedTestResultTimer?.cancel();
+      _speedTestResultTimer = Timer(const Duration(seconds: 6), () {
+        if (!mounted) return;
+        setState(() {
+          _speedTestMbps = null;
+          _speedTestError = null;
+        });
+      });
+    } on PlatformException catch (error) {
+      if (mounted) {
+        setState(() => _speedTestError = error.message ?? 'Speed test failed.');
+        _speedTestResultTimer?.cancel();
+        _speedTestResultTimer = Timer(const Duration(seconds: 6), () {
+          if (!mounted) return;
+          setState(() => _speedTestError = null);
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _speedTestRunning = false);
+    }
+  }
+
+  Future<void> setAutoUpdateEnabled(bool enabled) async {
+    if (!mounted) return;
+    setState(() => _autoUpdateEnabled = enabled);
+    await _storage.write(
+      key: 'auto_update_enabled_v1',
+      value: enabled ? 'true' : 'false',
+    );
+    if (enabled) unawaited(_checkForAndroidUpdates(automatic: true));
+  }
+
+  Future<void> setUpdateUseActiveRoute(bool enabled) async {
+    if (!mounted) return;
+    setState(() => _updateUseActiveRoute = enabled);
+    await _storage.write(
+      key: 'update_use_active_route_v1',
+      value: enabled ? 'true' : 'false',
+    );
+  }
+
+  Future<void> setUpdateIncludePrerelease(bool enabled) async {
+    if (!mounted) return;
+    setState(() => _updateIncludePrerelease = enabled);
+    await _storage.write(
+      key: 'update_include_prerelease_v1',
+      value: enabled ? 'true' : 'false',
+    );
+  }
+
+  Future<void> _checkForAndroidUpdates({
+    bool automatic = false,
+    BuildContext? notificationContext,
+    bool? includePrerelease,
+    ValueChanged<AboutUpdateStatus>? onStatus,
+  }) async {
+    if (_updateCheckInFlight || (automatic && !_autoUpdateEnabled)) {
+      if (!automatic) onStatus?.call(AboutUpdateStatus.error);
+      return;
+    }
+    if (automatic) {
+      final last = DateTime.tryParse(
+        await _storage.read(key: 'update_last_check_v1') ?? '',
+      );
+      if (last != null &&
+          DateTime.now().difference(last) < const Duration(hours: 24)) {
+        return;
+      }
+    }
+    _updateCheckInFlight = true;
+    if (!automatic) onStatus?.call(AboutUpdateStatus.checking);
+    try {
+      final currentVersion = await _androidUpdates.installedVersion();
+      if (mounted && currentVersion != _appVersion) {
+        setState(() => _appVersion = currentVersion);
+      }
+      final release = await _androidUpdates.latestAndroidRelease(
+        includePrerelease: includePrerelease ?? _updateIncludePrerelease,
+        useActiveRoute: _updateUseActiveRoute,
+      );
+      if (release == null) {
+        throw StateError(
+          _locale.languageCode == 'fa'
+              ? 'در کانال انتخاب‌شده بستهٔ Android سازگار با این گوشی پیدا نشد.'
+              : 'No Android package for this device was found in the selected channel.',
+        );
+      }
+      if (automatic) {
+        await _storage.write(
+          key: 'update_last_check_v1',
+          value: DateTime.now().toIso8601String(),
+        );
+      }
+      if (!mounted) return;
+      final comparison = _androidUpdates.compareVersions(
+        release.version,
+        currentVersion,
+      );
+      if (comparison < 0 && automatic) return;
+      final cached = await _androidUpdates.findDownloaded(release.package);
+      final partial = cached == null
+          ? await _androidUpdates.findPartial(release.package)
+          : null;
+      if (automatic && comparison <= 0) return;
+      if (cached != null || comparison != 0 || partial != null) {
+        if (!automatic) onStatus?.call(AboutUpdateStatus.available);
+        final context = notificationContext ?? _navigatorKey.currentContext;
+        if (context != null && context.mounted) {
+          await _showAndroidUpdateAvailable(
+            context,
+            release,
+            currentVersion: currentVersion,
+            cached: cached,
+            partial: partial,
+            isDowngrade: comparison < 0,
+            alreadyOnLatest: comparison == 0,
+          );
+        }
+      } else if (!automatic) {
+        onStatus?.call(AboutUpdateStatus.upToDate);
+      }
+    } catch (error) {
+      if (!automatic && mounted) {
+        onStatus?.call(AboutUpdateStatus.error);
+        _showUpdateMessage(notificationContext, error.toString());
+      }
+    } finally {
+      _updateCheckInFlight = false;
+    }
+  }
+
+  void _showUpdateMessage(BuildContext? preferredContext, String message) {
+    final context = preferredContext?.mounted == true
+        ? preferredContext!
+        : _navigatorKey.currentContext;
+    if (context == null || !context.mounted) return;
+    unawaited(
+      showDialog<void>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          content: SelectableText(message),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: Text(_locale.languageCode == 'fa' ? 'باشه' : 'OK'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showAndroidUpdateAvailable(
+    BuildContext context,
+    AndroidUpdateRelease release, {
+    required String currentVersion,
+    File? cached,
+    File? partial,
+    required bool isDowngrade,
+    required bool alreadyOnLatest,
+  }) async {
+    final isFa = _locale.languageCode == 'fa';
+    if (cached != null) {
+      final install = await showDialog<bool>(
+        context: context,
+        barrierDismissible: true,
+        builder: (dialogContext) => AlertDialog(
+          title: Text(
+            alreadyOnLatest
+                ? (isFa
+                      ? 'نسخهٔ ${release.version} از قبل دریافت شده'
+                      : 'Build ${release.version} is already downloaded')
+                : (isFa
+                      ? 'نسخهٔ ${release.version} آمادهٔ نصب است'
+                      : 'Connecso ${release.version} is ready to install'),
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                isFa
+                    ? 'فایل APK از قبل در دستگاه است و آمادهٔ نصب است.'
+                    : 'The APK is already on this device and ready to install.',
+              ),
+              const SizedBox(height: 10),
+              SelectableText(
+                cached.path,
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: Text(isFa ? 'بعداً' : 'Later'),
+            ),
+            FilledButton.icon(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              icon: const Icon(Icons.install_mobile_rounded),
+              label: Text(isFa ? 'نصب نسخه' : 'Install update'),
+            ),
+          ],
+        ),
+      );
+      if (install == true) await _androidUpdates.install(cached);
+      return;
+    }
+
+    final confirm = await showDialog<bool>(
+      context: context,
+      barrierDismissible: true,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(
+          partial != null
+              ? (isFa
+                    ? 'ادامهٔ دریافت نسخهٔ ${release.version}'
+                    : 'Resume download ${release.version}')
+              : isDowngrade
+              ? (isFa
+                    ? 'نسخهٔ پایین‌تر ${release.version} موجود است'
+                    : 'Downgrade to ${release.version}?')
+              : (isFa
+                    ? 'نسخهٔ ${release.version} در دسترس است'
+                    : 'Connecso ${release.version} is available'),
+        ),
+        content: SizedBox(
+          width: (MediaQuery.sizeOf(context).width - 88)
+              .clamp(260.0, 420.0)
+              .toDouble(),
+          height: (MediaQuery.sizeOf(context).height * 0.42)
+              .clamp(210.0, 300.0)
+              .toDouble(),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                isFa
+                    ? 'نسخهٔ فعلی: $currentVersion'
+                    : 'Current version: $currentVersion',
+              ),
+              if (isDowngrade) ...[
+                const SizedBox(height: 8),
+                Text(
+                  isFa
+                      ? 'نسخهٔ فعلی شما جدیدتر است؛ دریافت این بسته نسخه را پایین می‌آورد.'
+                      : 'Your installed build is newer. Downloading this package will downgrade the app.',
+                ),
+              ],
+              if (partial != null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  isFa
+                      ? 'دریافت نیمه‌تمام پیدا شد و از همان‌جا ادامه می‌یابد.'
+                      : 'A partial download was found and will resume from where it stopped.',
+                ),
+              ],
+              const SizedBox(height: 10),
+              Text(
+                isFa ? 'تغییرات این نسخه' : 'What’s new',
+                style: const TextStyle(fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 6),
+              Expanded(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.all(10),
+                    child: SelectableText(
+                      release.changelog.isEmpty
+                          ? (isFa
+                                ? 'توضیحی برای این انتشار ثبت نشده است.'
+                                : 'No release notes were published.')
+                          : release.changelog,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Flexible(
+                    child: Text(
+                      isFa
+                          ? 'بسته: Android APK · ${release.package.name}'
+                          : 'Package: Android APK · ${release.package.name}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(_formatAndroidUpdateSize(release.package.sizeBytes)),
+                ],
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: Text(isFa ? 'لغو' : 'Cancel'),
+          ),
+          FilledButton.icon(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            icon: const Icon(Icons.download_rounded),
+            label: Text(
+              partial != null
+                  ? (isFa ? 'ادامهٔ دریافت' : 'Resume download')
+                  : (isFa ? 'دریافت نسخه' : 'Download update'),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true || !context.mounted) return;
+    await _downloadAndroidUpdate(context, release);
+  }
+
+  Future<void> _downloadAndroidUpdate(
+    BuildContext context,
+    AndroidUpdateRelease release,
+  ) async {
+    final isFa = _locale.languageCode == 'fa';
+    final id = DateTime.now().microsecondsSinceEpoch.toString();
+    final progress = ValueNotifier<AndroidUpdateProgress>(
+      AndroidUpdateProgress(
+        id: id,
+        receivedBytes: 0,
+        totalBytes: release.package.sizeBytes,
+        state: 'downloading',
+      ),
+    );
+    final directory = await _androidUpdates.downloadDirectory;
+    if (!context.mounted) return;
+    var paused = false;
+    var completed = false;
+    var closed = false;
+    var cancelled = false;
+    String? errorText;
+    final subscription = _androidUpdates.progress.listen((value) {
+      if (value.id == id) progress.value = value;
+    });
+    final downloadTask = _androidUpdates.startDownload(
+      id: id,
+      package: release.package,
+      useActiveRoute: _updateUseActiveRoute,
+    );
+    unawaited(
+      downloadTask
+          .then((result) {
+            if (result['status'] == 'completed') completed = true;
+            if (result['status'] == 'closed') closed = true;
+            if (result['status'] == 'cancelled') cancelled = true;
+            progress.value = AndroidUpdateProgress(
+              id: id,
+              receivedBytes: completed
+                  ? release.package.sizeBytes
+                  : progress.value.receivedBytes,
+              totalBytes: release.package.sizeBytes,
+              state: '${result['status'] ?? 'completed'}',
+            );
+            if (_navigatorKey.currentContext?.mounted == true) {
+              // The dialog's ValueListenableBuilder observes completion and updates its actions.
+            }
+          })
+          .catchError((Object error) {
+            errorText = error.toString();
+            progress.value = AndroidUpdateProgress(
+              id: id,
+              receivedBytes: progress.value.receivedBytes,
+              totalBytes: release.package.sizeBytes,
+              state: 'error',
+            );
+          }),
+    );
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => ValueListenableBuilder<AndroidUpdateProgress>(
+        valueListenable: progress,
+        builder: (dialogContext, value, _) {
+          completed = value.state == 'completed' || completed;
+          closed = value.state == 'closed' || closed;
+          cancelled = value.state == 'cancelled' || cancelled;
+          final isComplete = value.state == 'completed' || completed;
+          return AlertDialog(
+            title: Text(
+              isComplete
+                  ? (isFa ? 'دریافت کامل شد' : 'Download complete')
+                  : (isFa
+                        ? 'در حال دریافت به‌روزرسانی…'
+                        : 'Downloading update…'),
+            ),
+            content: SizedBox(
+              width: (MediaQuery.sizeOf(context).width - 88)
+                  .clamp(240.0, 340.0)
+                  .toDouble(),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  LinearProgressIndicator(
+                    value: isComplete
+                        ? 1
+                        : value.totalBytes > 0 && value.receivedBytes > 0
+                        ? value.fraction
+                        : null,
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    errorText ??
+                        '${isComplete ? 100 : (value.fraction * 100).round()}%',
+                  ),
+                  const SizedBox(height: 8),
+                  SelectableText(
+                    '$directory${Platform.pathSeparator}${release.package.name}',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ),
+            ),
+            actions: isComplete
+                ? [
+                    TextButton(
+                      onPressed: () => Navigator.of(dialogContext).pop(),
+                      child: Text(isFa ? 'بستن' : 'Close'),
+                    ),
+                    FilledButton.icon(
+                      onPressed: () async {
+                        final file = await _androidUpdates.findDownloaded(
+                          release.package,
+                        );
+                        if (file != null && dialogContext.mounted) {
+                          Navigator.of(dialogContext).pop();
+                          await _androidUpdates.install(file);
+                        }
+                      },
+                      icon: const Icon(Icons.install_mobile_rounded),
+                      label: Text(isFa ? 'نصب به‌روزرسانی' : 'Install update'),
+                    ),
+                  ]
+                : [
+                    TextButton(
+                      onPressed: () async {
+                        await _androidUpdates.controlDownload(id, 'cancel');
+                        Navigator.of(dialogContext).pop();
+                      },
+                      child: Text(isFa ? 'لغو دریافت' : 'Cancel download'),
+                    ),
+                    TextButton(
+                      onPressed: () async {
+                        paused = !paused;
+                        await _androidUpdates.controlDownload(
+                          id,
+                          paused ? 'pause' : 'resume',
+                        );
+                        progress.value = AndroidUpdateProgress(
+                          id: id,
+                          receivedBytes: value.receivedBytes,
+                          totalBytes: value.totalBytes,
+                          state: paused ? 'paused' : 'downloading',
+                        );
+                      },
+                      child: Text(
+                        paused
+                            ? (isFa ? 'ادامه' : 'Resume')
+                            : (isFa ? 'مکث' : 'Pause'),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () async {
+                        await _androidUpdates.controlDownload(id, 'close');
+                        Navigator.of(dialogContext).pop();
+                      },
+                      child: Text(isFa ? 'بستن پنجره' : 'Close window'),
+                    ),
+                  ],
+          );
+        },
+      ),
+    );
+    try {
+      await downloadTask;
+    } catch (error) {
+      errorText ??= error.toString();
+    }
+    await subscription.cancel();
+    progress.dispose();
+    if (closed || cancelled) return;
+    if (errorText != null && context.mounted) {
+      _showUpdateMessage(
+        context,
+        isFa ? 'دریافت ناموفق بود: $errorText' : 'Download failed: $errorText',
+      );
+    }
+  }
+
+  String _formatAndroidUpdateSize(int bytes) {
+    if (bytes <= 0)
+      return _locale.languageCode == 'fa' ? 'نامشخص' : 'Size unknown';
+    if (bytes >= 1024 * 1024 * 1024)
+      return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _quickTileSyncTimer?.cancel();
+    _speedTestResultTimer?.cancel();
     _statsTimer?.cancel();
     _healthTimer?.cancel();
+    _updateCheckTimer?.cancel();
+    _androidUpdates.dispose();
     _subscriptions.close();
     unawaited(_history.close());
     super.dispose();
   }
 
+  List<Map<String, Object?>> _widgetDestinationEntries() {
+    final enabledNodes = _nodes.where((node) => node.enabled).toList();
+    final favoriteNodes = enabledNodes.where(_isWidgetFavorite).toList();
+    final visibleNodes =
+        (favoriteNodes.isNotEmpty ? favoriteNodes : enabledNodes).take(80);
+    return visibleNodes.map((node) {
+      final location = _locations.resolve(node);
+      return <String, Object?>{
+        'nodeId': node.id,
+        'countryCode': location?.countryCode ?? node.countryCode ?? '',
+        'countryName': location?.country ?? node.country ?? node.name,
+        'nodeName': node.name,
+        'protocol': node.protocol.name.toUpperCase(),
+        'config': jsonEncode(
+          XrayConfigBuilder(fakeDnsEnabled: _vpn.fakeDnsEnabled).build(node),
+        ),
+        'mode': _splitPolicy.mode.name,
+        'packages': _splitPolicy.packageNames.toList()..sort(),
+      };
+    }).toList();
+  }
+
+  bool _isWidgetFavorite(VpnNode node) {
+    final location = _locations.resolve(node);
+    final code = LocationResolver.canonicalCountryCode(
+      location?.countryCode ?? node.countryCode ?? node.country,
+    );
+    return _favoriteDestinationKeys.contains('node:${node.id}') ||
+        (code.isNotEmpty && _favoriteDestinationKeys.contains(code));
+  }
+
   @override
   Widget build(BuildContext context) {
-    const navy = Color(0xFF061925);
+    final widgetNode = _destinationNode ?? _activeNode;
+    final widgetLocation = widgetNode == null
+        ? null
+        : _locations.resolve(widgetNode);
+    final widgetData = <String, Object?>{
+      'connected': _phase == ConnectionPhase.connected,
+      'connectionFailed': _phase == ConnectionPhase.failed,
+      'country': widgetLocation?.country ?? widgetNode?.country ?? '',
+      'language': _locale.languageCode,
+      'darkTheme':
+          _themeMode == ThemeMode.dark ||
+          (_themeMode == ThemeMode.system &&
+              WidgetsBinding.instance.platformDispatcher.platformBrightness ==
+                  Brightness.dark),
+      'usedBytes': _quota.usedBytes,
+      'totalBytes': _quota.totalBytes,
+      'remainingBytes': _quota.remainingBytes,
+      'unlimited': _quota.unlimited,
+      'quotaAvailable': _quota.usedBytes != null,
+      'widgetDestinations': jsonEncode(_widgetDestinationEntries()),
+      'widgetHasFavorites': _nodes.any(
+        (node) => node.enabled && _isWidgetFavorite(node),
+      ),
+    };
+    final widgetSyncKey = jsonEncode(widgetData);
+    if (widgetSyncKey != _lastWidgetSyncKey) {
+      _lastWidgetSyncKey = widgetSyncKey;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_vpn.updateWidgetData(widgetData));
+      });
+    }
+    const navy = Color(0xFF05080C);
     final dark = ThemeData(
       brightness: Brightness.dark,
       scaffoldBackgroundColor: navy,
       colorScheme:
           ColorScheme.fromSeed(
-            seedColor: const Color(0xFF59CBE8),
+            seedColor: const Color(0xFF00D9F5),
             brightness: Brightness.dark,
           ).copyWith(
-            surface: const Color(0xFF0A2634),
-            surfaceContainerHighest: const Color(0xFF0C2C3A),
-            surfaceContainer: const Color(0xFF0D3141),
-            outline: const Color(0xFF326A7D),
-            primary: const Color(0xFF59CBE8),
+            surface: const Color(0xFF0A0F15),
+            surfaceContainerHighest: const Color(0xFF101820),
+            surfaceContainer: const Color(0xFF0C141B),
+            outline: const Color(0xFF126477),
+            primary: const Color(0xFF00D9F5),
             onSurface: const Color(0xFFF4F7FA),
             onSurfaceVariant: const Color(0xFFC8D2DA),
           ),
@@ -1988,12 +3446,16 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
       useMaterial3: true,
     );
     return MaterialApp(
+      navigatorKey: _navigatorKey,
       title: 'CONNECSO',
       debugShowCheckedModeBanner: false,
       showPerformanceOverlay: _debugPerformanceOverlay,
       theme: light,
       darkTheme: dark,
       themeMode: _themeMode,
+      themeAnimationDuration: _performanceMode
+          ? Duration.zero
+          : const Duration(milliseconds: 200),
       locale: _locale,
       supportedLocales: const [Locale('en'), Locale('fa')],
       localizationsDelegates: const [
@@ -2001,7 +3463,14 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
         GlobalWidgetsLocalizations.delegate,
         GlobalCupertinoLocalizations.delegate,
       ],
+      builder: (context, child) => MediaQuery(
+        data: MediaQuery.of(
+          context,
+        ).copyWith(disableAnimations: _performanceMode),
+        child: child ?? const SizedBox.shrink(),
+      ),
       home: HomeScreen(
+        appVersion: _appVersion,
         loading: _loading,
         nodes: _nodes,
         phase: _phase,
@@ -2033,9 +3502,17 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
         language: _locale,
         themeMode: _themeMode,
         sourceCountryCode: _sourceCountryCode,
-        destination: (_destinationNode ?? _activeNode) == null
+        destination:
+            (_phase == ConnectionPhase.connected
+                    ? (_activeNode ?? _destinationNode)
+                    : (_destinationNode ?? _activeNode)) ==
+                null
             ? null
-            : _locations.resolve(_destinationNode ?? _activeNode!),
+            : _destinationLocationFor(
+                _phase == ConnectionPhase.connected
+                    ? (_activeNode ?? _destinationNode)
+                    : (_destinationNode ?? _activeNode),
+              ),
         splitTunnelingBuilder: (_) => SplitTunnelingScreen(
           language: _locale,
           loadApplications: _installedApplications,
@@ -2059,8 +3536,101 @@ class _ConnecsoAppState extends State<ConnecsoApp> with WidgetsBindingObserver {
         subscriptionRevision: _subscriptionRevisionNotifier,
         connectionMethod: _connectionMethod,
         onConnectionMethodChanged: _setConnectionMethod,
+        performanceMode: _performanceMode,
+        onPerformanceModeChanged: setPerformanceMode,
+        onSpeedTest: _runSpeedTest,
+        speedTestRunning: _speedTestRunning,
+        speedTestMbps: _speedTestMbps,
+        speedTestError: _speedTestError,
+        onAddQuickSettingsTile: () async {
+          try {
+            final added = await _vpn.requestAddQuickSettingsTile();
+            if (!mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  added
+                      ? (_locale.languageCode == 'fa'
+                            ? 'درخواست افزودن کاشی ارسال شد.'
+                            : 'Quick Settings tile request sent.')
+                      : (_locale.languageCode == 'fa'
+                            ? 'این نسخهٔ اندروید افزودن کاشی را پشتیبانی نمی‌کند.'
+                            : 'This Android version cannot add a tile from the app.'),
+                ),
+              ),
+            );
+          } on PlatformException catch (error) {
+            if (mounted)
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text(error.message ?? 'Unable to add tile.')),
+              );
+          }
+        },
+        onAddHomeScreenWidget: () async {
+          try {
+            final added = await _vpn.requestAddHomeScreenWidget();
+            if (!mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  added
+                      ? (_locale.languageCode == 'fa'
+                            ? 'درخواست افزودن ویجت ارسال شد.'
+                            : 'Widget request sent.')
+                      : (_locale.languageCode == 'fa'
+                            ? 'لانچر دستگاه افزودن ویجت را پشتیبانی نمی‌کند.'
+                            : 'The launcher does not support pinning widgets.'),
+                ),
+              ),
+            );
+          } on PlatformException catch (error) {
+            if (mounted)
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(error.message ?? 'Unable to add widget.'),
+                ),
+              );
+          }
+        },
+        refreshingActiveSubscription:
+            _activeSubscriptionId != null &&
+            _refreshingSubscriptionIds.contains(_activeSubscriptionId),
+        canRefreshActiveSubscription:
+            _activeSubscriptionId != null &&
+            _savedSubscriptions.any(
+              (profile) =>
+                  profile.id == _activeSubscriptionId &&
+                  profile.endpoint?.isNotEmpty == true,
+            ) &&
+            !const {
+              ConnectionPhase.preparing,
+              ConnectionPhase.connecting,
+              ConnectionPhase.verifying,
+              ConnectionPhase.reconnecting,
+              ConnectionPhase.disconnecting,
+            }.contains(_phase),
+        autoUpdateEnabled: _autoUpdateEnabled,
+        updateUseActiveRoute: _updateUseActiveRoute,
+        updateIncludePrerelease: _updateIncludePrerelease,
+        onAutoUpdateChanged: setAutoUpdateEnabled,
+        onUpdateRouteChanged: setUpdateUseActiveRoute,
+        onUpdatePrereleaseChanged: setUpdateIncludePrerelease,
+        onCheckUpdates: (dialogContext, includePrerelease, onStatus) =>
+            _checkForAndroidUpdates(
+              notificationContext: dialogContext,
+              includePrerelease: includePrerelease,
+              onStatus: onStatus,
+            ),
+        onRefreshActiveSubscription: _activeSubscriptionId == null
+            ? null
+            : () => refreshSavedSubscription(_activeSubscriptionId!),
         destinationSelection: _destinationSelection,
         onDestinationSelectionChanged: _setDestinationSelection,
+        onPingDestinations: _pingDestinations,
+        onCancelDestinationPings: _cancelDestinationPings,
+        favoriteDestinationKeys: _favoriteDestinationKeys,
+        recentDestinationCountryCode: _recentDestinationCountryCode,
+        onDestinationFavoriteChanged: setDestinationFavorite,
       ),
     );
   }

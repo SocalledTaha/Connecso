@@ -8,6 +8,20 @@ import 'core_manager.dart';
 import 'location_resolver.dart';
 import 'smart_selector.dart';
 
+/// A ranked set of reachable candidates from the highest viable tier.
+/// [checkedNodeIds] also includes nodes that were probed and found unreachable,
+/// so a later failover pass can expand to the next tier without probing them
+/// again.
+class EndpointResolution {
+  const EndpointResolution({
+    required this.endpoints,
+    required this.checkedNodeIds,
+  });
+
+  final List<ResolvedEndpoint> endpoints;
+  final Set<String> checkedNodeIds;
+}
+
 class EndpointResolver {
   EndpointResolver({
     required CoreManager cores,
@@ -15,10 +29,9 @@ class EndpointResolver {
   }) : _cores = cores,
        _selector = selector;
 
-  // A dead endpoint must not stall the user-facing connection flow.  The
-  // native probe already has its own bounded phases; three seconds is enough
-  // to accept a responsive endpoint while allowing us to move to the next
-  // candidate quickly.
+  // Native pingBatch uses the same Xray runtime, so keep candidate probes
+  // serialized and bounded. This is a reachability check, not the displayed
+  // warm HTTP ping used by the connected-session UI.
   static const probeTimeout = Duration(seconds: 3);
   final CoreManager _cores;
   final SmartSelector _selector;
@@ -29,11 +42,43 @@ class EndpointResolver {
     VpnNode? current,
     Set<String> excludedNodeIds = const {},
     SelectionReason? reason,
+    String? lastGoodNodeId,
+    Set<String> preferredCountryCodes = const {},
+  }) async {
+    final result = await resolveCandidates(
+      nodes: nodes,
+      selection: selection,
+      current: current,
+      excludedNodeIds: excludedNodeIds,
+      reason: reason,
+      lastGoodNodeId: lastGoodNodeId,
+      preferredCountryCodes: preferredCountryCodes,
+    );
+    if (result.endpoints.isEmpty) {
+      throw const CoreException('No reachable endpoint matched the selection.');
+    }
+    return result.endpoints.first;
+  }
+
+  Future<EndpointResolution> resolveCandidates({
+    required Iterable<VpnNode> nodes,
+    required DestinationSelection selection,
+    VpnNode? current,
+    Set<String> excludedNodeIds = const {},
+    SelectionReason? reason,
+    String? lastGoodNodeId,
+    Set<String> preferredCountryCodes = const {},
   }) async {
     await _cores.initialize();
-    final requestedCountry = selection.countryCode == null
-        ? null
+    final canonicalSelection = selection.countryCode == null
+        ? ''
         : LocationResolver.canonicalCountryCode(selection.countryCode!);
+    // A node can have no recognizable country metadata. Its synthetic UI
+    // group is still selectable by exact nodeId; do not filter it out because
+    // the synthetic label itself is not an ISO country code.
+    final requestedCountry = canonicalSelection.isEmpty
+        ? null
+        : canonicalSelection;
     final allEligible = nodes.where((node) {
       if (excludedNodeIds.contains(node.id) ||
           !node.enabled ||
@@ -44,11 +89,6 @@ class EndpointResolver {
         return false;
       }
       if (requestedCountry == null) return true;
-      // Use the same metadata resolver as the UI/map.  Subscription rows are
-      // not consistent: some carry an ISO code, some a display name (often
-      // prefixed, such as `XNetherlands`), and some only carry structured
-      // location metadata.  Country locking must group all of those forms
-      // without changing the node or the downstream dataplane.
       final nodeCountry = LocationResolver.canonicalCountryCode(
         '${node.countryCode ?? ''} ${node.country ?? ''} ${node.name}',
       );
@@ -57,163 +97,98 @@ class EndpointResolver {
           : LocationResolver().resolve(node)?.countryCode ?? '';
       return resolvedCountry == requestedCountry;
     }).toList();
+
+    final now = DateTime.now().toUtc();
     final eligible = allEligible.where((node) {
       final failure = node.lastFailure;
       final coolingDown =
           node.consecutiveFailures >= 2 &&
           failure != null &&
-          DateTime.now().toUtc().difference(failure.toUtc()) <
-              const Duration(minutes: 5);
+          now.difference(failure.toUtc()) < const Duration(minutes: 5);
       return !coolingDown;
     }).toList();
-    // Never make a destination unavailable only because every candidate has
-    // a recent failure record. In that case, retry the complete scoped pool.
-    final scopedEligible = eligible.isEmpty ? allEligible : eligible;
+    // If every scoped candidate is cooling down, still give the scoped pool
+    // one bounded attempt instead of making the selected country unavailable.
+    final candidates = eligible.isEmpty ? allEligible : eligible;
     developer.log(
-      'endpoint_scope country=${requestedCountry ?? 'AUTO'} method=${selection.method?.name ?? 'AUTO'} eligible=${scopedEligible.length}',
+      'endpoint_scope country=${requestedCountry ?? 'AUTO'} method=${selection.method?.name ?? 'AUTO'} eligible=${candidates.length}',
       name: 'CONNECSO/Resolver',
     );
-    if (scopedEligible.isEmpty) {
+    if (candidates.isEmpty) {
       throw const CoreException('No usable subscription nodes.');
     }
-    final candidates = scopedEligible;
 
-    // Connection startup must not wait on a serial subscription-wide probe
-    // batch. SmartSelector already has the persisted health/latency history;
-    // use that ordering immediately and let the real Android dataplane
-    // verification validate the selected endpoint after Xray/TUN start.
-    // A previously connected node is the fastest safe retry.  It has already
-    // passed the full dataplane verification, and it is still constrained by
-    // the country/method-filtered `eligible` pool above.  Re-probing it before
-    // reconnecting only adds startup latency; the next background probe can
-    // refresh its warm RTT after the tunnel is back.
-    VpnNode? previous;
-    if (current != null) {
-      for (final node in candidates) {
-        if (node.id == current.id) {
-          previous = node;
-          break;
-        }
-      }
-    }
-    final immediate =
-        previous ?? _selector.select(candidates, current: current);
-    // ConnectionManager only supplies `current` after the previous endpoint
-    // has completed the real Android dataplane verification. Reuse that exact
-    // endpoint on a same-scope reconnect even when the asynchronous warm-ping
-    // persistence has not finished yet. The country/method-filtered candidate
-    // list above remains the guard against carrying it into another scope.
-    if (previous != null && current != null) {
-      _assertInScope(previous, requestedCountry, selection);
-      developer.log(
-        'endpoint_verified_reuse node=${previous.id}',
-        name: 'CONNECSO/Resolver',
-      );
-      return ResolvedEndpoint(
-        node: previous,
-        requestedCountryCode: requestedCountry,
-        reason:
-            reason ??
-            (requestedCountry == null
-                ? SelectionReason.automatic
-                : SelectionReason.countryLocked),
-      );
-    }
-    // Do not treat an unverified first node as an AutoSelector result.  Some
-    // subscriptions put a deliberately incomplete transport variant first
-    // (for example WS without ECH while the following variants have ECH). In
-    // a country-locked scope that made the tunnel start successfully but left
-    // the selected country's warm RTT unavailable. Only reuse an endpoint
-    // when its persisted health and latency prove that this exact node has
-    // already carried traffic.
-    final immediateIsVerified =
-        immediate != null &&
-        immediate.authoritativeLatency != null &&
-        (immediate.runtimeState == RuntimeHealthState.healthy ||
-            immediate.health == NodeHealth.healthy);
-    if (immediateIsVerified) {
-      _assertInScope(immediate, requestedCountry, selection);
-      developer.log(
-        'endpoint_immediate node=${immediate.id}',
-        name: 'CONNECSO/Resolver',
-      );
-      return ResolvedEndpoint(
-        node: immediate,
-        requestedCountryCode: requestedCountry,
-        reason:
-            reason ??
-            (requestedCountry == null
-                ? SelectionReason.automatic
-                : SelectionReason.countryLocked),
-      );
-    }
-
-    // A recently verified node is already an AutoSelector result. Re-probing
-    // it synchronously on every tap only delays startVpn and can contend with
-    // a background native probe. Use the cached proof for a short window;
-    // failed sessions still fall through to the full probe path on retry.
-    final now = DateTime.now().toUtc();
-    final cached = candidates.where((node) {
-      final success = node.lastSuccess;
-      final probe = node.lastProbe;
-      return (node.runtimeState == RuntimeHealthState.healthy ||
-              node.health == NodeHealth.healthy) &&
-          node.authoritativeLatency != null &&
-          probe != null &&
-          now.difference(probe.toUtc()) <= const Duration(minutes: 5) &&
-          // Older cache records may have a valid probe/latency but no
-          // lastSuccess field. The recent healthy probe is still sufficient
-          // to avoid repeating a slow native handshake on the next tap.
-          (success == null ||
-              now.difference(success.toUtc()) <= const Duration(minutes: 5));
-    }).toList();
-    developer.log(
-      'endpoint_cache_scan cached=${cached.length} candidates=${candidates.length} '
-      'details=${candidates.map((node) => '${node.id}:${node.health.name}/${node.runtimeState.name}/'
-          'lat=${node.authoritativeLatency?.inMilliseconds ?? -1}/'
-          'probe=${node.lastProbe != null}/success=${node.lastSuccess != null}').join(',')}',
-      name: 'CONNECSO/Resolver',
+    final checked = <String>{};
+    final tiers = List<int>.generate(
+      preferredCountryCodes.isEmpty ? 4 : 5,
+      (index) => index + 1,
+      growable: false,
     );
-    if (cached.isNotEmpty) {
-      final selected = _selector.select(cached, current: current);
-      if (selected != null) {
-        developer.log(
-          'endpoint_cached node=${selected.id} age=${now.difference((selected.lastSuccess ?? selected.lastProbe)!.toUtc()).inSeconds}s',
-          name: 'CONNECSO/Resolver',
-        );
-        return ResolvedEndpoint(
-          node: selected,
-          requestedCountryCode: requestedCountry,
-          reason:
-              reason ??
-              (requestedCountry == null
-                  ? SelectionReason.automatic
-                  : SelectionReason.countryLocked),
-        );
-      }
-    }
-
-    for (var tier = 1; tier <= 4; tier++) {
+    final selectedNode = candidates
+        .where((node) => node.id == selection.nodeId)
+        .firstOrNull;
+    final tierOrder = selectedNode == null
+        ? tiers
+        : [
+            _selector.tier(
+              selectedNode,
+              preferredCountryCodes: preferredCountryCodes,
+            ),
+            ...tiers.where(
+              (tier) =>
+                  tier !=
+                  _selector.tier(
+                    selectedNode,
+                    preferredCountryCodes: preferredCountryCodes,
+                  ),
+            ),
+          ];
+    for (final tier in tierOrder) {
       final tierNodes = candidates
-          .where((node) => _selector.tier(node) == tier)
+          .where(
+            (node) =>
+                _selector.tier(
+                  node,
+                  preferredCountryCodes: preferredCountryCodes,
+                ) ==
+                tier,
+          )
           .toList();
       if (tierNodes.isEmpty) continue;
-      // Once a session has carried traffic, keep its transport profile as a
-      // cross-country preference (WS/XHTTP/Hysteria2, TLS/Reality, ALPN,
-      // fingerprint and ECH). Country filtering still remains authoritative;
-      // this only changes probe order inside the selected country.
-      if (current != null) {
-        tierNodes.sort(
-          (a, b) => _metadataAffinity(
+
+      // Last Good and existing health scores only affect probe order. Every
+      // candidate in this tier is still considered before choosing, so a
+      // failed actual tunnel can fall through to another same-country node.
+      tierNodes.sort((a, b) {
+        final aExplicit = a.id == selection.nodeId;
+        final bExplicit = b.id == selection.nodeId;
+        if (aExplicit != bExplicit) return aExplicit ? -1 : 1;
+        final aLastGood = a.id == lastGoodNodeId || a.id == current?.id;
+        final bLastGood = b.id == lastGoodNodeId || b.id == current?.id;
+        if (aLastGood != bLastGood) return aLastGood ? -1 : 1;
+        if (current != null) {
+          final affinity = _metadataAffinity(
             b,
             current,
-          ).compareTo(_metadataAffinity(a, current)),
-        );
-      }
-      // Keep the established native probe serialization: one native Xray
-      // probe at a time. This avoids racing independent temporary cores.
+          ).compareTo(_metadataAffinity(a, current));
+          if (affinity != 0) return affinity;
+        }
+        final score = _selector.score(b).compareTo(_selector.score(a));
+        if (score != 0) return score;
+        return a.id.compareTo(b.id);
+      });
+
       final reachable = <VpnNode>[];
       for (final node in tierNodes) {
+        checked.add(node.id);
+        if (_hasFreshSuccessfulProbe(node, now)) {
+          reachable.add(node);
+          developer.log(
+            'endpoint_probe_cached node=${node.id} tier=$tier',
+            name: 'CONNECSO/Resolver',
+          );
+          continue;
+        }
         final core = _cores.choose(node);
         if (core == null) continue;
         final passed = await core
@@ -226,27 +201,110 @@ class EndpointResolver {
         );
         if (passed) {
           reachable.add(node);
-          // The dataplane will perform the authoritative verification after
-          // Xray/TUN startup. Once one candidate in the requested scope has
-          // passed the native probe, probing every sibling serially only adds
-          // seconds to connection startup and does not improve readiness.
-          break;
+          // Check every candidate in the current priority tier before ranking.
+          // ConnectionManager needs the full reachable set to retry a sibling
+          // immediately if the selected endpoint fails during tunnel startup.
         }
       }
+
       if (reachable.isEmpty) continue;
-      final selected = _selector.select(reachable, current: current);
-      if (selected == null) continue;
-      return ResolvedEndpoint(
-        node: selected,
-        requestedCountryCode: requestedCountry,
-        reason:
-            reason ??
-            (requestedCountry == null
-                ? SelectionReason.automatic
-                : SelectionReason.countryLocked),
+      final ranked = _rankCandidates(
+        reachable,
+        lastGoodNodeId: lastGoodNodeId ?? current?.id,
+        preferredCountryCodes: preferredCountryCodes,
+      );
+      if (selection.nodeId != null &&
+          ranked.any((node) => node.id == selection.nodeId)) {
+        ranked.sort((a, b) {
+          if (a.id == selection.nodeId) return -1;
+          if (b.id == selection.nodeId) return 1;
+          return 0;
+        });
+      }
+      final selectionReason =
+          reason ??
+          (requestedCountry == null
+              ? SelectionReason.automatic
+              : SelectionReason.countryLocked);
+      return EndpointResolution(
+        checkedNodeIds: Set.unmodifiable(checked),
+        endpoints: List.unmodifiable(
+          ranked.map(
+            (node) => ResolvedEndpoint(
+              node: node,
+              requestedCountryCode: requestedCountry,
+              reason: selectionReason,
+            ),
+          ),
+        ),
       );
     }
-    throw const CoreException('No reachable endpoint matched the selection.');
+    return EndpointResolution(
+      endpoints: const [],
+      checkedNodeIds: Set.unmodifiable(checked),
+    );
+  }
+
+  bool _hasFreshSuccessfulProbe(VpnNode node, DateTime now) {
+    final probe = node.lastProbe;
+    final success = node.lastSuccess;
+    return node.runtimeState != RuntimeHealthState.hardFailure &&
+        node.runtimeState != RuntimeHealthState.dead &&
+        (node.runtimeState == RuntimeHealthState.healthy ||
+            node.health == NodeHealth.healthy) &&
+        node.authoritativeLatency != null &&
+        probe != null &&
+        now.difference(probe.toUtc()) <= const Duration(minutes: 5) &&
+        (success == null ||
+            now.difference(success.toUtc()) <= const Duration(minutes: 5));
+  }
+
+  List<VpnNode> _rankCandidates(
+    List<VpnNode> nodes, {
+    required String? lastGoodNodeId,
+    required Set<String> preferredCountryCodes,
+  }) {
+    if (nodes.length < 2) return nodes;
+    final measured = nodes
+        .map((node) => node.authoritativeLatency?.inMilliseconds)
+        .whereType<int>()
+        .where((latency) => latency > 0)
+        .toList();
+    final bestLatency = measured.isEmpty
+        ? null
+        : measured.reduce((a, b) => a < b ? a : b);
+    double score(VpnNode node) {
+      final country = _countryPriority(node, preferredCountryCodes);
+      final pingMs = node.authoritativeLatency?.inMilliseconds;
+      final ping = bestLatency == null || pingMs == null || pingMs <= 0
+          ? 0.0
+          : (40 * bestLatency / pingMs).clamp(0.0, 40.0);
+      final lastGood = node.id == lastGoodNodeId ? 20.0 : 0.0;
+      return country + ping + lastGood;
+    }
+
+    return [...nodes]..sort((a, b) {
+      final difference = score(b).compareTo(score(a));
+      if (difference != 0) return difference;
+      return a.id.compareTo(b.id);
+    });
+  }
+
+  int _countryPriority(VpnNode node, Set<String> preferredCountryCodes) {
+    final country = LocationResolver.canonicalCountryCode(
+      '${node.countryCode ?? ''} ${node.country ?? ''} ${node.name}',
+    ).toLowerCase();
+    if (preferredCountryCodes.isNotEmpty) {
+      return preferredCountryCodes
+              .map((code) => code.toLowerCase())
+              .contains(country)
+          ? 60
+          : 0;
+    }
+    if ({'nl', 'de', 'gb', 'uk'}.contains(country)) return 50;
+    if ({'tr', 'fr', 'us'}.contains(country)) return 40;
+    if ({'ca', 'it'}.contains(country)) return 30;
+    return 0;
   }
 
   int _metadataAffinity(VpnNode candidate, VpnNode reference) {
@@ -257,44 +315,25 @@ class EndpointResolver {
     }
     if (candidate.protocol == reference.protocol) score += 2;
     if ((candidate.sni ?? '').toLowerCase() ==
-        (reference.sni ?? '').toLowerCase())
+        (reference.sni ?? '').toLowerCase()) {
       score++;
+    }
     if ((candidate.fingerprint ?? 'chrome').toLowerCase() ==
-        (reference.fingerprint ?? 'chrome').toLowerCase())
+        (reference.fingerprint ?? 'chrome').toLowerCase()) {
       score++;
+    }
     for (final key in const [
       'security',
       'alpn',
       'echConfigList',
       'echForceQuery',
     ]) {
-      if ((candidate.credentials[key] ?? '').toLowerCase() ==
-              (reference.credentials[key] ?? '').toLowerCase() &&
-          candidate.credentials[key] != null) {
+      if (candidate.credentials[key] != null &&
+          candidate.credentials[key]!.toLowerCase() ==
+              (reference.credentials[key] ?? '').toLowerCase()) {
         score++;
       }
     }
     return score;
-  }
-
-  void _assertInScope(
-    VpnNode node,
-    String? requestedCountry,
-    DestinationSelection selection,
-  ) {
-    if (selection.method != null && !selection.method!.matches(node)) {
-      throw const CoreException(
-        'Selected endpoint does not match the requested connection method.',
-      );
-    }
-    if (requestedCountry == null) return;
-    final resolved = LocationResolver.canonicalCountryCode(
-      '${node.countryCode ?? ''} ${node.country ?? ''} ${node.name}',
-    );
-    if (resolved != requestedCountry) {
-      throw const CoreException(
-        'Selected endpoint does not match the requested destination country.',
-      );
-    }
   }
 }

@@ -407,6 +407,21 @@ void main() {
     expect(unresolved?.longitude, isNull);
   });
 
+  test('uses explicit exit coordinates to correct a contradictory country', () {
+    final destination = const LocationResolver().resolve(
+      node(id: 'auto-metadata').copyWithForTest(
+        name: 'Automatic route',
+        country: 'Kosovo',
+        countryCode: 'XK',
+        latitude: 52.3676,
+        longitude: 4.9041,
+      ),
+    );
+
+    expect(destination?.country, 'Netherlands');
+    expect(destination?.countryCode, 'NL');
+  });
+
   test(
     'resolves country from the connection label when location is absent',
     () {
@@ -494,6 +509,8 @@ extension on VpnNode {
     String? name,
     String? country,
     String? countryCode,
+    double? latitude,
+    double? longitude,
   }) => VpnNode(
     id: id,
     subscriptionId: subscriptionId,
@@ -505,8 +522,8 @@ extension on VpnNode {
     country: country ?? this.country,
     countryCode: countryCode ?? this.countryCode,
     city: city,
-    latitude: latitude,
-    longitude: longitude,
+    latitude: latitude ?? this.latitude,
+    longitude: longitude ?? this.longitude,
   );
 }
 

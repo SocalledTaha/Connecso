@@ -7,7 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   test(
-    'selects immediately from the eligible country scope',
+    'probes every candidate in the selected country tier and ranks them',
     () async {
       final core = _ProbeCore();
       final resolver = EndpointResolver(cores: CoreManager(core));
@@ -23,7 +23,7 @@ void main() {
       );
 
       expect(result.node.id, 'fast');
-      expect(core.probed, isEmpty);
+      expect(core.probed, containsAll(['fast', 'slow']));
       expect(core.probed, isNot(contains('other-country')));
     },
   );
@@ -46,7 +46,7 @@ void main() {
     );
 
     expect(result.node.id, 'xhttp');
-    expect(core.probed, isEmpty);
+    expect(core.probed, ['xhttp']);
   });
 
   test('hysteria2 selection matches the hysteria transport family', () async {
@@ -65,8 +65,65 @@ void main() {
     );
 
     expect(result.node.id, 'hy2');
-    expect(core.probed, isEmpty);
+    expect(core.probed, ['hy2']);
   });
+
+  test(
+    'unknown-country connection remains selectable by exact node id',
+    () async {
+      final core = _ProbeCore();
+      final resolver = EndpointResolver(cores: CoreManager(core));
+      final selected = _node('opaque-node', '', 55);
+      final result = await resolver.resolve(
+        nodes: [selected, _node('other-node', 'DE', 20)],
+        selection: const DestinationSelection.country(
+          'UNKNOWN',
+          nodeId: 'opaque-node',
+        ),
+      );
+
+      expect(result.node.id, 'opaque-node');
+    },
+  );
+
+  test(
+    'returns every reachable same-country candidate for tunnel fallback',
+    () async {
+      final core = _ProbeCore();
+      final resolver = EndpointResolver(cores: CoreManager(core));
+      final result = await resolver.resolveCandidates(
+        nodes: [
+          _node('first', 'DE', 90),
+          _node('second', 'DE', 120),
+          _node('other-country', 'FR', 20),
+        ],
+        selection: const DestinationSelection.country('DE'),
+      );
+
+      expect(result.endpoints.map((endpoint) => endpoint.node.id), [
+        'first',
+        'second',
+      ]);
+      expect(result.checkedNodeIds, containsAll(['first', 'second']));
+      expect(core.probed, containsAll(['first', 'second']));
+      expect(core.probed, isNot(contains('other-country')));
+    },
+  );
+
+  test(
+    'expands to the next priority tier only when the current tier has no reachable node',
+    () async {
+      final core = _ProbeCore()..unreachableIds.add('germany');
+      final resolver = EndpointResolver(cores: CoreManager(core));
+      final result = await resolver.resolveCandidates(
+        nodes: [_node('germany', 'DE', 90), _node('france', 'FR', 120)],
+        selection: const DestinationSelection.auto(),
+      );
+
+      expect(result.endpoints.single.node.id, 'france');
+      expect(core.probed, ['germany', 'france']);
+    },
+  );
 }
 
 VpnNode _node(String id, String country, int latency) => VpnNode(
@@ -103,6 +160,7 @@ VpnNode _nodeWithTransport(
 
 class _ProbeCore implements ProxyCore {
   final probed = <String>[];
+  final unreachableIds = <String>{};
   @override
   ProxyCoreKind get kind => ProxyCoreKind.xray;
   @override
@@ -122,7 +180,7 @@ class _ProbeCore implements ProxyCore {
   @override
   Future<bool> testConnection(VpnNode node) async {
     probed.add(node.id);
-    return true;
+    return !unreachableIds.contains(node.id);
   }
 
   @override

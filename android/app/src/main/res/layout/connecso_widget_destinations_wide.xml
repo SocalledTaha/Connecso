@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="horizontal"
+    android:gravity="center_vertical"
+    android:background="@drawable/connecso_widget_background"
+    android:paddingHorizontal="7dp"
+    android:paddingVertical="5dp">
+    <ImageView android:id="@+id/widget_logo" android:layout_width="24dp" android:layout_height="30dp" android:contentDescription="Connecso" android:scaleType="fitCenter" android:src="@drawable/connecso_widget_logo_light" />
+    <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="0.85" android:layout_marginStart="5dp" android:orientation="vertical">
+        <TextView android:id="@+id/widget_state" android:layout_width="match_parent" android:layout_height="wrap_content" android:maxLines="1" android:ellipsize="end" android:text="Connected" android:textColor="@color/widget_primary_text" android:textSize="9sp" android:textStyle="bold" />
+        <TextView android:id="@+id/widget_detail" android:layout_width="match_parent" android:layout_height="wrap_content" android:maxLines="1" android:ellipsize="end" android:text="Connecso" android:textColor="@color/widget_secondary_text" android:textSize="8sp" />
+        <TextView android:id="@+id/widget_usage" android:layout_width="match_parent" android:layout_height="wrap_content" android:maxLines="1" android:ellipsize="end" android:text="Used —" android:textColor="@color/widget_accent" android:textSize="8sp" android:textStyle="bold" />
+        <ProgressBar android:id="@+id/widget_quota" style="?android:attr/progressBarStyleHorizontal" android:layout_width="match_parent" android:layout_height="3dp" android:max="100" android:progress="0" android:progressTint="@color/widget_accent" android:progressBackgroundTint="@color/widget_progress_track" />
+    </LinearLayout>
+    <LinearLayout android:id="@+id/widget_destination_panel" android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1.15" android:layout_marginStart="4dp" android:orientation="vertical" android:paddingHorizontal="3dp">
+        <TextView android:id="@+id/widget_destinations_label" android:layout_width="match_parent" android:layout_height="wrap_content" android:maxLines="1" android:ellipsize="end" android:text="Favorites" android:textColor="@color/widget_secondary_text" android:textSize="8sp" android:textStyle="bold" />
+        <ListView android:id="@+id/widget_destinations" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1" android:divider="@android:color/transparent" android:dividerHeight="1dp" android:scrollbars="none" />
+        <TextView android:id="@+id/widget_destinations_empty" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1" android:gravity="center" android:maxLines="2" android:text="No destinations" android:textColor="@color/widget_secondary_text" android:textSize="8sp" />
+    </LinearLayout>
+    <ImageView android:id="@+id/widget_action" android:layout_width="34dp" android:layout_height="34dp" android:layout_marginStart="3dp" android:background="@drawable/connecso_widget_power_idle" android:padding="9dp" android:scaleType="fitCenter" android:src="@drawable/ic_widget_power" />
+</LinearLayout>

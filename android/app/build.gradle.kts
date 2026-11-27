@@ -60,6 +60,10 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Keep local test builds side-by-side with the signed public app.
+            applicationIdSuffix = ".preview"
+        }
         release {
             signingConfig = signingConfigs.getByName("connecsoRelease")
         }

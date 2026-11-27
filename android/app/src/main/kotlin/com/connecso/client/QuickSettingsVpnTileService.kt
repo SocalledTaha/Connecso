@@ -11,6 +11,7 @@ import android.os.Handler
 import android.os.Looper
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
+import android.graphics.drawable.Icon
 import android.util.AtomicFile
 import android.util.Base64
 import org.json.JSONArray
@@ -77,6 +78,8 @@ class QuickSettingsVpnTileService : TileService() {
                 .putExtra(ConnecsoVpnService.EXTRA_CONFIG, configuration.getString("config"))
                 .putExtra(ConnecsoVpnService.EXTRA_SPLIT_MODE, configuration.optString("mode", "off"))
                 .putExtra(ConnecsoVpnService.EXTRA_NODE_ID, configuration.optString("nodeId"))
+                .putExtra(ConnecsoVpnService.EXTRA_COUNTRY_NAME, configuration.optString("countryName"))
+                .putExtra(ConnecsoVpnService.EXTRA_COUNTRY_CODE, configuration.optString("countryCode"))
                 .putStringArrayListExtra(
                     ConnecsoVpnService.EXTRA_SPLIT_PACKAGES,
                     ArrayList<String>(packages.length()).apply {
@@ -108,6 +111,7 @@ class QuickSettingsVpnTileService : TileService() {
         qsTile?.let { tile ->
             tile.state = if (active) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
             tile.label = "CONNECSO"
+            tile.icon = Icon.createWithResource(this, R.drawable.connecso_logo)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 tile.subtitle = if (resources.configuration.locales[0].language == "fa") {
                     if (active) "قطع اتصال" else "اتصال"
@@ -158,12 +162,16 @@ internal object QuickTileStore {
         mode: String,
         packages: List<String>,
         nodeId: String,
+        countryName: String = "",
+        countryCode: String = "",
     ) {
         val plainText = JSONObject()
             .put("config", config)
             .put("mode", mode)
             .put("packages", JSONArray(packages))
             .put("nodeId", nodeId)
+            .put("countryName", countryName)
+            .put("countryCode", countryCode)
             .toString()
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
@@ -211,6 +219,7 @@ internal object QuickTileStore {
         context.sendBroadcast(
             Intent(ACTION_STATE_CHANGED).setPackage(context.packageName),
         )
+        ConnecsoWidgetProvider.refresh(context)
         requestTileRefresh(context)
     }
 
