@@ -165,6 +165,8 @@ class ConnecsoVpnService : VpnService(), DialerController {
                 ?: throw IllegalArgumentException("Xray configuration is missing.")
             val nodeId = intent.getStringExtra(EXTRA_NODE_ID)
                 ?: throw IllegalArgumentException("Active VPN node is missing.")
+            val countryName = intent.getStringExtra(EXTRA_COUNTRY_NAME).orEmpty()
+            val countryCode = intent.getStringExtra(EXTRA_COUNTRY_CODE).orEmpty()
             val requestedMode = intent.getStringExtra(EXTRA_SPLIT_MODE) ?: SPLIT_EXCLUDE
             val mode = if (requestedMode == SPLIT_OFF) SPLIT_EXCLUDE else requestedMode
             val selectedPackages = if (requestedMode == SPLIT_OFF) emptyList()
@@ -177,6 +179,8 @@ class ConnecsoVpnService : VpnService(), DialerController {
                     requestedMode,
                     selectedPackages,
                     nodeId,
+                    countryName,
+                    countryCode,
                 )
             }.onFailure {
                 Log.w(TAG, "event=quick_tile_profile_save_failed")
@@ -476,6 +480,8 @@ class ConnecsoVpnService : VpnService(), DialerController {
         const val EXTRA_REQUEST_ID = "requestId"
         const val EXTRA_CONFIG = "config"
         const val EXTRA_NODE_ID = "nodeId"
+        const val EXTRA_COUNTRY_NAME = "countryName"
+        const val EXTRA_COUNTRY_CODE = "countryCode"
         const val EXTRA_SPLIT_MODE = "splitTunnelMode"
         const val EXTRA_SPLIT_PACKAGES = "splitTunnelPackages"
         const val EXTRA_OPERATION = "operation"

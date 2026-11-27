@@ -51,6 +51,8 @@ class QuickSettingsVpnTileService : TileService() {
                 .putExtra(ConnecsoVpnService.EXTRA_CONFIG, configuration.getString("config"))
                 .putExtra(ConnecsoVpnService.EXTRA_SPLIT_MODE, configuration.optString("mode", "off"))
                 .putExtra(ConnecsoVpnService.EXTRA_NODE_ID, configuration.optString("nodeId"))
+                .putExtra(ConnecsoVpnService.EXTRA_COUNTRY_NAME, configuration.optString("countryName"))
+                .putExtra(ConnecsoVpnService.EXTRA_COUNTRY_CODE, configuration.optString("countryCode"))
                 .putStringArrayListExtra(
                     ConnecsoVpnService.EXTRA_SPLIT_PACKAGES,
                     ArrayList<String>(packages.length()).apply {
@@ -127,12 +129,16 @@ internal object QuickTileStore {
         mode: String,
         packages: List<String>,
         nodeId: String,
+        countryName: String = "",
+        countryCode: String = "",
     ) {
         val plainText = JSONObject()
             .put("config", config)
             .put("mode", mode)
             .put("packages", JSONArray(packages))
             .put("nodeId", nodeId)
+            .put("countryName", countryName)
+            .put("countryCode", countryCode)
             .toString()
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
